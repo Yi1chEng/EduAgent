@@ -1,0 +1,20 @@
+{
+  "_comment": "外部 MCP Server 配置（Claude Desktop 兼容格式）。删除 _comment 字段后生效。示例已注释，把 _disabled 改名为 servers 中的 key 即可启用。",
+  "mcpServers": {
+    "_disabled_filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/app/uploads"]
+    },
+    "_disabled_fetch": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-fetch"]
+    },
+    "_disabled_github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_xxx"
+      }
+    }
+  }
+}
