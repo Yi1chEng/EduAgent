@@ -1,12 +1,20 @@
-"""向量检索模块：基于 pgvector 的 cosine 距离检索。"""
+"""向量检索 + 关键词召回 + RRF 融合 + 可选 reranker。
+
+- 向量层：pgvector cosine 距离，over-fetch top_k * RAG_OVERFETCH_MULTIPLIER
+- 关键词层：在 over-fetched 候选内，用查询中的关键词命中数排序
+- 融合：Reciprocal Rank Fusion（RRF, k=RAG_RRF_K）
+- 可选 reranker：若 RERANKER_API_KEY 已配置，调用 SiliconFlow bge-reranker 二次排序
+"""
 
 import logging
 import re
 from typing import Any, Optional
 
+import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.db.database import async_session_factory
 from app.rag.embeddings import embed_text
 
@@ -14,6 +22,15 @@ logger = logging.getLogger(__name__)
 
 # 中文章节匹配（第一章/第1章/第十章 等）
 _CHAPTER_PATTERN = re.compile(r"第\s*([一二三四五六七八九十百零\d]+)\s*章")
+
+# 关键词抽取：连续 CJK 字符段（≥2）或 ASCII 单词（≥2）
+_KEYWORD_PATTERN = re.compile(r"[一-鿿]{2,}|[A-Za-z0-9_]{2,}")
+
+# 不参与关键词召回的停用片段
+_KEYWORD_STOPWORDS = frozenset({
+    "什么", "怎么", "如何", "为什么", "请", "请问", "你能", "帮我", "告诉", "解释",
+    "what", "how", "why", "the", "and", "for", "with", "please", "tell",
+})
 
 
 def _detect_chapter_filter(query: str) -> Optional[str]:
@@ -25,23 +42,118 @@ def _detect_chapter_filter(query: str) -> Optional[str]:
     return None
 
 
+def _extract_keywords(query: str) -> list[str]:
+    """提取查询中可用于关键词召回的实义词片段。"""
+    tokens = _KEYWORD_PATTERN.findall(query)
+    seen: set[str] = set()
+    result: list[str] = []
+    for tok in tokens:
+        low = tok.lower()
+        if low in _KEYWORD_STOPWORDS:
+            continue
+        if low in seen:
+            continue
+        seen.add(low)
+        result.append(tok)
+    return result
+
+
+def _keyword_score(text_body: str, keywords: list[str]) -> int:
+    """文档对查询关键词的命中分（按出现次数累加）。"""
+    if not keywords:
+        return 0
+    lower = text_body.lower()
+    score = 0
+    for kw in keywords:
+        score += lower.count(kw.lower())
+    return score
+
+
+def _rrf_fuse(
+    vector_ranked: list[dict[str, Any]],
+    keyword_ranked: list[dict[str, Any]],
+    k: int,
+) -> list[dict[str, Any]]:
+    """Reciprocal Rank Fusion：score = sum(1 / (k + rank))。
+
+    依靠 id 作为去重键。
+    """
+    scores: dict[Any, float] = {}
+    by_id: dict[Any, dict[str, Any]] = {}
+
+    for rank, doc in enumerate(vector_ranked, start=1):
+        doc_id = doc["id"]
+        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        by_id[doc_id] = doc
+
+    for rank, doc in enumerate(keyword_ranked, start=1):
+        doc_id = doc["id"]
+        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(doc_id, doc)
+
+    fused = [
+        {**by_id[doc_id], "rrf_score": score}
+        for doc_id, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+    return fused
+
+
+async def _rerank(query: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """调用外部 reranker API（如未配置则原样返回）。"""
+    settings = get_settings()
+    if not settings.RERANKER_API_KEY or not docs:
+        return docs
+
+    payload = {
+        "model": settings.RERANKER_MODEL_NAME,
+        "query": query,
+        "documents": [d["text"] for d in docs],
+        "return_documents": False,
+    }
+    headers = {"Authorization": f"Bearer {settings.RERANKER_API_KEY}"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                settings.RERANKER_BASE_URL, json=payload, headers=headers
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.warning(f"Reranker 调用失败，回退到 RRF 顺序: {e}")
+        return docs
+
+    results = data.get("results") or []
+    if not results:
+        return docs
+
+    reranked: list[dict[str, Any]] = []
+    for item in results:
+        idx = item.get("index")
+        score = item.get("relevance_score") or item.get("score") or 0.0
+        if idx is None or idx >= len(docs):
+            continue
+        reranked.append({**docs[idx], "rerank_score": float(score)})
+    return reranked
+
+
 async def retrieve(
     query: str,
     top_k: int = 5,
     db: AsyncSession | None = None,
 ) -> list[dict[str, Any]]:
-    """根据用户查询进行向量检索，返回最相似的 top_k 个文本块。
-
-    若查询中包含明确章节信息（如"第一章"），则优先在该章节内检索。
+    """混合检索：向量召回 + 关键词召回 → RRF 融合 → 可选 reranker。
 
     Args:
         query: 用户查询文本。
-        top_k: 返回的最大结果数。
+        top_k: 最终返回数量。
         db: 可选的数据库会话；未传入时自动创建。
 
     Returns:
         检索结果列表，每个元素包含 text, source_file, heading_path, chunk_index, score。
     """
+    settings = get_settings()
+    overfetch = max(top_k, top_k * settings.RAG_OVERFETCH_MULTIPLIER)
+
     query_embedding = await embed_text(query)
     embedding_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
 
@@ -59,11 +171,11 @@ async def retrieve(
             FROM knowledge_chunks
             WHERE source_file LIKE :chapter_filter
             ORDER BY embedding <=> :query_embedding
-            LIMIT :top_k
+            LIMIT :overfetch
         """)
         params = {
             "query_embedding": embedding_str,
-            "top_k": top_k,
+            "overfetch": overfetch,
             "chapter_filter": chapter_filter,
         }
     else:
@@ -77,26 +189,54 @@ async def retrieve(
                 embedding <=> :query_embedding AS distance
             FROM knowledge_chunks
             ORDER BY embedding <=> :query_embedding
-            LIMIT :top_k
+            LIMIT :overfetch
         """)
-        params = {"query_embedding": embedding_str, "top_k": top_k}
+        params = {"query_embedding": embedding_str, "overfetch": overfetch}
 
     async def _execute(session: AsyncSession) -> list[dict[str, Any]]:
         result = await session.execute(sql, params)
         rows = result.fetchall()
-        docs: list[dict[str, Any]] = []
-        for row in rows:
-            docs.append({
+        return [
+            {
+                "id": row.id,
                 "text": row.original_text,
                 "source_file": row.source_file,
                 "heading_path": row.heading_path,
                 "chunk_index": row.chunk_index,
                 "score": 1.0 - float(row.distance),  # cosine similarity
-            })
-        return docs
+            }
+            for row in rows
+        ]
 
     if db is not None:
-        return await _execute(db)
+        candidates = await _execute(db)
     else:
         async with async_session_factory() as session:
-            return await _execute(session)
+            candidates = await _execute(session)
+
+    if not candidates:
+        return []
+
+    # 关键词层：在候选集内按关键词命中重新排
+    keywords = _extract_keywords(query)
+    if keywords:
+        scored = [
+            (_keyword_score(c["text"], keywords), c) for c in candidates
+        ]
+        keyword_ranked = [
+            c for s, c in sorted(scored, key=lambda x: x[0], reverse=True) if s > 0
+        ]
+    else:
+        keyword_ranked = []
+
+    fused = _rrf_fuse(candidates, keyword_ranked, k=settings.RAG_RRF_K)
+
+    # 截断到 top_k * 2 后再交给（可选的）reranker，避免重排过多
+    pre_rerank = fused[: max(top_k * 2, top_k)]
+    reranked = await _rerank(query, pre_rerank)
+
+    final = reranked[:top_k]
+    logger.info(
+        f"混合检索: 候选 {len(candidates)} → 融合 {len(fused)} → 重排 {len(reranked)} → 返回 {len(final)}"
+    )
+    return final

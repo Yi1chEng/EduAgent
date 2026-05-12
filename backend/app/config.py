@@ -25,6 +25,15 @@ class Settings(BaseSettings):
     EMBEDDING_BASE_URL: str = "https://api.openai.com/v1"
     EMBEDDING_MODEL_NAME: str = "text-embedding-3-small"
 
+    # Reranker（可选）：留空则不启用重排，仅做 BM25/向量混合
+    RERANKER_API_KEY: str = ""
+    RERANKER_BASE_URL: str = "https://api.siliconflow.cn/v1/rerank"
+    RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-v2-m3"
+
+    # 混合检索参数
+    RAG_OVERFETCH_MULTIPLIER: int = 4  # 向量层先取 top_k * N 个候选
+    RAG_RRF_K: int = 60  # RRF 融合常数
+
     # 数据库配置
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/eduagent"
 

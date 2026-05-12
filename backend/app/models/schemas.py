@@ -29,6 +29,7 @@ class ChatResponse(BaseModel):
 class SessionListItem(BaseModel):
     """会话列表项。"""
     session_id: str
+    title: Optional[str] = Field(default=None, description="LLM 自动生成的会话标题")
     last_message: str = Field(..., description="最后一条消息预览")
     last_role: str = Field(..., description="最后一条消息角色")
     message_count: int

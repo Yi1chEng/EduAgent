@@ -17,6 +17,7 @@ export interface ChatResponse {
 
 export interface SessionListItem {
   session_id: string;
+  title?: string | null;
   last_message: string;
   last_role: string;
   message_count: number;

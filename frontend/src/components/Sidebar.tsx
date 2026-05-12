@@ -111,8 +111,9 @@ export function Sidebar({
                   className={`text-sm leading-snug truncate ${
                     active ? "text-ink-700 font-medium" : "text-ink-600"
                   }`}
+                  title={s.last_message || ""}
                 >
-                  {s.last_message || "(空会话)"}
+                  {s.title || s.last_message || "(空会话)"}
                 </p>
                 <p className="text-xs text-ink-400 mt-0.5">
                   {s.message_count} 条 · {formatTime(s.updated_at)}

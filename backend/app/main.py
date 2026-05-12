@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import chat, feedback, knowledge
 from app.config import get_settings
 from app.db.init_db import init_database
+from app.graph.nodes import _get_mcp_tools
+from app.rag.embeddings import _get_embeddings_model
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +22,7 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """应用生命周期管理：启动时初始化数据库、创建上传目录。"""
+    """应用生命周期管理：启动时初始化数据库、创建上传目录、预热外部依赖。"""
     # 启动阶段
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     try:
@@ -28,6 +30,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("数据库初始化完成")
     except Exception as e:
         logger.warning(f"数据库初始化跳过（可能未连接）: {e}")
+
+    # 预热：Embedding 客户端（同步构造，避免首请求时阻塞 event loop）
+    try:
+        _get_embeddings_model()
+        logger.info("Embedding 模型已预热")
+    except Exception as e:
+        logger.warning(f"Embedding 预热失败: {e}")
+
+    # 预热：MCP 工具（fork stdio 子进程 + 工具列表，首请求省 1~3s）
+    try:
+        tools = await _get_mcp_tools()
+        logger.info(f"MCP 工具已预热，共 {len(tools)} 个")
+    except Exception as e:
+        logger.warning(f"MCP 工具预热失败: {e}")
+
     yield
     # 关闭阶段
     logger.info("应用关闭")

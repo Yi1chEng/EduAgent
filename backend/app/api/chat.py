@@ -7,11 +7,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select, text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from app.db.database import get_db
+from app.db.database import async_session_factory, get_db
 from app.graph.builder import app_graph
 from app.graph.edges import route_after_generation
 from app.graph.nodes import (
@@ -22,7 +22,8 @@ from app.graph.nodes import (
     _infer_diagram_type,
     dispatcher_node,
 )
-from app.models.db_models import Conversation, Feedback
+from app.graph.titles import schedule_title_generation
+from app.models.db_models import Conversation, Feedback, Session as SessionModel
 from app.models.schemas import (
     ChatRequest,
     ChatResponse,
@@ -159,6 +160,7 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)) -> Chat
     """同步对话接口：执行完整 LangGraph 流程，一次性返回结果。"""
     try:
         history = await _load_history(db, request.session_id)
+        is_first_turn = len(history) == 0
         await _save_conversation(db, request.session_id, "user", request.query)
 
         payload = request.model_dump()
@@ -182,6 +184,9 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)) -> Chat
             json.dumps(citations, ensure_ascii=False) if citations else None,
         )
 
+        if is_first_turn:
+            schedule_title_generation(request.session_id, request.query)
+
         return ChatResponse(
             conversation_id=assistant_conv.id,
             content=content,
@@ -196,11 +201,13 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)) -> Chat
 
 
 @router.post("/chat/stream")
-async def chat_stream(
-    request: ChatRequest,
-    db: AsyncSession = Depends(get_db),
-) -> EventSourceResponse:
+async def chat_stream(request: ChatRequest) -> EventSourceResponse:
     """SSE 真·token 流式对话：手动编排 RAG → 流式 LLM → dispatcher。
+
+    注意：不能用 `Depends(get_db)` —— FastAPI 在 endpoint return EventSourceResponse 时
+    会立即关闭依赖注入的 db session，但 SSE generator 才刚开始迭代，所有 _save_conversation
+    都会写入一个已关闭的连接（事务回滚 + 消息丢失）。这里在 generator 内部用独立 session
+    并显式 commit。
 
     优化点：
     1. 用户消息保存与 RAG 检索并行（asyncio.gather）
@@ -221,98 +228,107 @@ async def chat_stream(
         logger.info(f"启发式判定无需 RAG: {request.query!r}")
 
     async def event_generator():
-        try:
-            # ===== Stage 1: RAG（按需）+ DB 写入 =====
-            retrieve_task = (
-                asyncio.create_task(retrieve(request.query, top_k=5)) if use_rag else None
-            )
-            history = await _load_history(db, request.session_id)
-            await _save_conversation(db, request.session_id, "user", request.query)
-            retrieved_docs = await retrieve_task if retrieve_task is not None else []
-
-            citations = build_citation_list(retrieved_docs) if retrieved_docs else []
-            yield {
-                "event": "citation",
-                "data": json.dumps(citations, ensure_ascii=False),
-            }
-
-            # ===== Stage 2: 并行启动 mermaid 生成（与正文流式同时进行） =====
-            # 关键性能点：不等正文写完，用 query + RAG 上下文当 description 直接开跑
-            mermaid_task: asyncio.Task[str] | None = None
-            if need_visualization:
-                mermaid_task = asyncio.create_task(
-                    _call_mermaid_with_context(request.query, retrieved_docs)
+        # 自管 session：声明周期与 generator 自身绑定，避免被 FastAPI 提前关闭
+        async with async_session_factory() as db:
+            try:
+                # ===== Stage 1: RAG（按需）+ DB 写入 =====
+                retrieve_task = (
+                    asyncio.create_task(retrieve(request.query, top_k=5)) if use_rag else None
                 )
+                history = await _load_history(db, request.session_id)
+                is_first_turn = len(history) == 0
+                await _save_conversation(db, request.session_id, "user", request.query)
+                await db.commit()  # 用户消息单独提交，确保即使后续异常也已落库
+                retrieved_docs = await retrieve_task if retrieve_task is not None else []
 
-            # ===== Stage 3: 流式生成正文 =====
-            if use_rag:
-                system_prompt = GENERATOR_SYSTEM_PROMPT.format(
-                    context=format_context(retrieved_docs),
-                    citations=format_citations(retrieved_docs),
-                )
-            else:
-                # 闲聊/元问题直接用简短系统提示，避免"资料不足"的尴尬回复
-                system_prompt = (
-                    "你是 EduAgent，专业的教育AI助手。直接、自然地回应用户消息。"
-                    "如果用户在打招呼或闲聊，简短热情地回应；如果在问你的功能，"
-                    "说明你能基于上传的教材回答学习问题、生成图表、推送笔记。"
-                )
-            llm_messages = [SystemMessage(content=system_prompt)]
-            llm_messages.extend(history[-10:])
-            llm_messages.append(HumanMessage(content=request.query))
+                citations = build_citation_list(retrieved_docs) if retrieved_docs else []
+                yield {
+                    "event": "citation",
+                    "data": json.dumps(citations, ensure_ascii=False),
+                }
 
-            final_content_parts: list[str] = []
-            async for chunk in _get_llm().astream(llm_messages):
-                token = getattr(chunk, "content", "")
-                if not token:
-                    continue
-                if isinstance(token, list):
-                    token = "".join(
-                        part.get("text", "") if isinstance(part, dict) else str(part)
-                        for part in token
+                # ===== Stage 2: 并行启动 mermaid 生成（与正文流式同时进行） =====
+                # 关键性能点：不等正文写完，用 query + RAG 上下文当 description 直接开跑
+                mermaid_task: asyncio.Task[str] | None = None
+                if need_visualization:
+                    mermaid_task = asyncio.create_task(
+                        _call_mermaid_with_context(request.query, retrieved_docs)
                     )
-                final_content_parts.append(token)
-                yield {"event": "token", "data": token}
 
-            final_content = "".join(final_content_parts)
+                # ===== Stage 3: 流式生成正文 =====
+                if use_rag:
+                    system_prompt = GENERATOR_SYSTEM_PROMPT.format(
+                        context=format_context(retrieved_docs),
+                        citations=format_citations(retrieved_docs),
+                    )
+                else:
+                    # 闲聊/元问题直接用简短系统提示，避免"资料不足"的尴尬回复
+                    system_prompt = (
+                        "你是 EduAgent，专业的教育AI助手。直接、自然地回应用户消息。"
+                        "如果用户在打招呼或闲聊，简短热情地回应；如果在问你的功能，"
+                        "说明你能基于上传的教材回答学习问题、生成图表、推送笔记。"
+                    )
+                llm_messages = [SystemMessage(content=system_prompt)]
+                llm_messages.extend(history[-10:])
+                llm_messages.append(HumanMessage(content=request.query))
 
-            # ===== Stage 4: 持久化 + 立即发 done（用户立刻能看到完整正文） =====
-            assistant_conv = await _save_conversation(
-                db,
-                request.session_id,
-                "assistant",
-                final_content,
-                json.dumps(citations, ensure_ascii=False) if citations else None,
-            )
-            yield {"event": "done", "data": str(assistant_conv.id)}
+                final_content_parts: list[str] = []
+                async for chunk in _get_llm().astream(llm_messages):
+                    token = getattr(chunk, "content", "")
+                    if not token:
+                        continue
+                    if isinstance(token, list):
+                        token = "".join(
+                            part.get("text", "") if isinstance(part, dict) else str(part)
+                            for part in token
+                        )
+                    final_content_parts.append(token)
+                    yield {"event": "token", "data": token}
 
-            # ===== Stage 5: 等并行的 mermaid 任务结束，单独推 mermaid 事件 =====
-            if mermaid_task is not None:
-                try:
-                    mermaid_code = await mermaid_task
-                    if mermaid_code:
-                        yield {"event": "mermaid", "data": mermaid_code}
-                except Exception as e:
-                    logger.error(f"并行 mermaid 失败: {e}")
+                final_content = "".join(final_content_parts)
 
-            # ===== Stage 6: 微信推送（需要正文，串行 OK） =====
-            if request.need_dispatch:
-                dispatcher_out = await dispatcher_node({
-                    "query": request.query,
-                    "need_visualization": False,
-                    "need_dispatch": True,
-                    "generated_content": final_content,
-                })
-                tool_results = dispatcher_out.get("tool_results") or {}
-                if tool_results:
-                    yield {
-                        "event": "tool_result",
-                        "data": json.dumps(tool_results, ensure_ascii=False),
-                    }
+                # ===== Stage 4: 持久化 + 立即发 done（用户立刻能看到完整正文） =====
+                assistant_conv = await _save_conversation(
+                    db,
+                    request.session_id,
+                    "assistant",
+                    final_content,
+                    json.dumps(citations, ensure_ascii=False) if citations else None,
+                )
+                await db.commit()
+                yield {"event": "done", "data": str(assistant_conv.id)}
 
-        except Exception as e:
-            logger.error(f"流式对话失败: {e}", exc_info=True)
-            yield {"event": "error", "data": str(e)}
+                if is_first_turn:
+                    schedule_title_generation(request.session_id, request.query)
+
+                # ===== Stage 5: 等并行的 mermaid 任务结束，单独推 mermaid 事件 =====
+                if mermaid_task is not None:
+                    try:
+                        mermaid_code = await mermaid_task
+                        if mermaid_code:
+                            yield {"event": "mermaid", "data": mermaid_code}
+                    except Exception as e:
+                        logger.error(f"并行 mermaid 失败: {e}")
+
+                # ===== Stage 6: 微信推送（需要正文，串行 OK） =====
+                if request.need_dispatch:
+                    dispatcher_out = await dispatcher_node({
+                        "query": request.query,
+                        "need_visualization": False,
+                        "need_dispatch": True,
+                        "generated_content": final_content,
+                    })
+                    tool_results = dispatcher_out.get("tool_results") or {}
+                    if tool_results:
+                        yield {
+                            "event": "tool_result",
+                            "data": json.dumps(tool_results, ensure_ascii=False),
+                        }
+
+            except Exception as e:
+                logger.error(f"流式对话失败: {e}", exc_info=True)
+                await db.rollback()
+                yield {"event": "error", "data": str(e)}
 
     return EventSourceResponse(event_generator())
 
@@ -343,43 +359,43 @@ async def _call_mermaid_with_context(query: str, retrieved_docs: list) -> str:
 
 @router.get("/sessions", response_model=SessionListResponse)
 async def list_sessions(db: AsyncSession = Depends(get_db)) -> SessionListResponse:
-    """列出所有会话，按最后活动时间倒序。"""
-    # 子查询：每个 session 的最后消息时间和消息数
-    stmt = (
-        select(
-            Conversation.session_id,
-            func.max(Conversation.created_at).label("updated_at"),
-            func.count(Conversation.id).label("message_count"),
-        )
-        .group_by(Conversation.session_id)
-        .order_by(func.max(Conversation.created_at).desc())
+    """列出所有会话，按最后活动时间倒序。
+
+    单条 SQL 同时获取：每个 session 的最后一条消息（DISTINCT ON）+ 消息总数（窗口函数），
+    避免按 session 数量循环发 SQL。
+    """
+    stmt = sql_text(
+        """
+        SELECT s.session_id, s.role, s.content, s.updated_at, s.message_count,
+               sess.title AS title
+        FROM (
+            SELECT DISTINCT ON (session_id)
+                session_id,
+                role,
+                content,
+                created_at AS updated_at,
+                COUNT(*) OVER (PARTITION BY session_id) AS message_count
+            FROM conversations
+            ORDER BY session_id, created_at DESC
+        ) s
+        LEFT JOIN sessions sess ON sess.session_id = s.session_id
+        ORDER BY s.updated_at DESC
+        """
     )
     result = await db.execute(stmt)
     rows = result.all()
 
-    sessions: list[SessionListItem] = []
-    for row in rows:
-        # 取该 session 的最后一条消息作为预览
-        last_stmt = (
-            select(Conversation)
-            .where(Conversation.session_id == row.session_id)
-            .order_by(Conversation.created_at.desc())
-            .limit(1)
+    sessions: list[SessionListItem] = [
+        SessionListItem(
+            session_id=row.session_id,
+            title=row.title,
+            last_message=row.content[:80] + ("…" if len(row.content) > 80 else ""),
+            last_role=row.role,
+            message_count=row.message_count,
+            updated_at=row.updated_at.isoformat(),
         )
-        last_result = await db.execute(last_stmt)
-        last_msg = last_result.scalar_one_or_none()
-        if last_msg is None:
-            continue
-        preview = last_msg.content[:80] + ("…" if len(last_msg.content) > 80 else "")
-        sessions.append(
-            SessionListItem(
-                session_id=row.session_id,
-                last_message=preview,
-                last_role=last_msg.role,
-                message_count=row.message_count,
-                updated_at=row.updated_at.isoformat(),
-            )
-        )
+        for row in rows
+    ]
     return SessionListResponse(sessions=sessions)
 
 
@@ -435,6 +451,8 @@ async def delete_session(
     deleted = await db.execute(
         delete(Conversation).where(Conversation.session_id == session_id)
     )
+    # 删除会话元数据（若有）
+    await db.execute(delete(SessionModel).where(SessionModel.session_id == session_id))
     return SessionDeleteResponse(
         message=f"会话 {session_id} 已删除",
         deleted_count=deleted.rowcount or len(conv_ids),

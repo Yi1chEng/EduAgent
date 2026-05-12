@@ -32,6 +32,27 @@ class KnowledgeChunk(Base):
         return f"<KnowledgeChunk(id={self.id}, source='{self.source_file}', heading='{self.heading_path}')>"
 
 
+class Session(Base):
+    """会话元数据表：保存自动生成的标题等不随消息变化的字段。"""
+
+    __tablename__ = "sessions"
+
+    session_id: Mapped[str] = mapped_column(String(128), primary_key=True, comment="会话ID")
+    title: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, comment="LLM 自动生成的会话标题")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), comment="创建时间"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="最近更新时间",
+    )
+
+    def __repr__(self) -> str:
+        return f"<Session(session_id='{self.session_id}', title='{self.title}')>"
+
+
 class Conversation(Base):
     """对话记录表，保存用户与AI的对话历史。"""
 
