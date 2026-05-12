@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -38,10 +39,33 @@ def _get_llm() -> ChatOpenAI:
     return _llm
 
 
+# ${VAR} 占位符：用于在 mcp_servers.json 的 env/args 中引用环境变量，避免把密钥写入仓库
+_ENV_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_env_placeholders(value: str) -> tuple[str, list[str]]:
+    """展开字符串中的 ${VAR} 占位符。
+
+    返回 (展开后的字符串, 缺失的变量名列表)。变量未设置或为空时记入缺失列表。
+    """
+    missing: list[str] = []
+
+    def _sub(match: re.Match[str]) -> str:
+        var = match.group(1)
+        resolved = os.environ.get(var, "")
+        if not resolved:
+            missing.append(var)
+        return resolved
+
+    return _ENV_PLACEHOLDER_PATTERN.sub(_sub, value), missing
+
+
 def _load_external_mcp_servers() -> dict[str, dict[str, Any]]:
     """从 mcp_servers.json 读取外部 MCP server 配置。
 
-    跳过以 '_' 开头的 key（约定为禁用项），返回 langchain-mcp-adapters 期望的格式。
+    - 跳过以 '_' 开头的 key（约定为禁用项）。
+    - 支持 env 和 args 中的 ${VAR} 占位符，从宿主环境变量解析。
+    - 若占位符引用的变量缺失，跳过该 server 并告警（避免子进程启动后才报错）。
     """
     path = Path(EXTERNAL_MCP_CONFIG_PATH)
     if not path.exists():
@@ -57,11 +81,38 @@ def _load_external_mcp_servers() -> dict[str, dict[str, Any]]:
     for name, cfg in servers.items():
         if name.startswith("_"):
             continue
+
+        missing_vars: list[str] = []
+
+        env_overrides: dict[str, str] = {}
+        for key, raw in cfg.get("env", {}).items():
+            if isinstance(raw, str):
+                expanded, missing = _expand_env_placeholders(raw)
+                missing_vars.extend(missing)
+                env_overrides[key] = expanded
+            else:
+                env_overrides[key] = raw
+
+        expanded_args: list[str] = []
+        for raw in cfg.get("args", []):
+            if isinstance(raw, str):
+                expanded, missing = _expand_env_placeholders(raw)
+                missing_vars.extend(missing)
+                expanded_args.append(expanded)
+            else:
+                expanded_args.append(raw)
+
+        if missing_vars:
+            logger.warning(
+                f"跳过 MCP server '{name}'：环境变量未设置或为空 {sorted(set(missing_vars))}"
+            )
+            continue
+
         result[name] = {
             "command": cfg["command"],
-            "args": cfg.get("args", []),
+            "args": expanded_args,
             "transport": "stdio",
-            "env": {**os.environ, **cfg.get("env", {})},
+            "env": {**os.environ, **env_overrides},
         }
     return result
 

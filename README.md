@@ -105,11 +105,18 @@ API 文档：http://localhost:8000/docs
 
 ## 集成第三方 MCP server
 
-编辑 `mcp_servers.json`，把示例里 `_disabled_xxx` 改为 `xxx` 即可启用：
+编辑 `mcp_servers.json`，把示例里 `_disabled_xxx` 改为 `xxx` 即可启用。`env` / `args` 支持 `${VAR}` 占位符，从 `backend/.env` 读取（避免密钥进仓库）；变量缺失时启动会**跳过该 server 并告警**，不影响其他工具。
 
 ```json
 {
   "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      }
+    },
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/app/uploads"]
@@ -118,8 +125,13 @@ API 文档：http://localhost:8000/docs
 }
 ```
 
-重启 backend：`docker compose restart backend`。  
-LLM 会在 `dispatcher` 阶段看到所有工具，按需自动调用。
+启用 GitHub MCP：
+
+1. 在 `backend/.env` 写入 `GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx`（[生成入口](https://github.com/settings/personal-access-tokens)）
+2. `docker compose restart backend`
+3. 启动日志看到 `MCP 服务器: [..., 'github']` 即接入成功
+
+LLM 会在 `dispatcher` 阶段看到所有工具，按需自动调用(列 issue、查 PR、读文件、提交等)。
 
 ---
 
