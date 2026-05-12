@@ -38,6 +38,15 @@ export interface KnowledgeListItem {
   created_at: string;
 }
 
+// MCP 工具单次调用记录（SSE tool_result 事件的载荷，每次调用一条）
+export interface ToolInvocation {
+  name: string;
+  args: Record<string, unknown>;
+  status: "success" | "error";
+  result?: string;
+  error?: string;
+}
+
 // 前端运行时消息状态（用于流式增量更新）
 export interface UIMessage {
   id?: number;
@@ -45,7 +54,7 @@ export interface UIMessage {
   content: string;
   citations: Citation[];
   mermaid_code?: string;
-  tool_results?: Record<string, unknown>;
+  tool_invocations?: ToolInvocation[];
   streaming?: boolean;
 }
 

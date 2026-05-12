@@ -10,6 +10,9 @@ import {
   Sparkles,
   User,
   Loader2,
+  Wrench,
+  CheckCircle2,
+  XCircle,
 } from "lucide-react";
 import { MermaidRenderer } from "./MermaidRenderer";
 import {
@@ -17,7 +20,7 @@ import {
   postFeedback,
   streamChat,
 } from "../lib/api";
-import type { Citation, UIMessage } from "../lib/types";
+import type { Citation, ToolInvocation, UIMessage } from "../lib/types";
 
 interface Props {
   sessionId: string;
@@ -106,7 +109,11 @@ export function ChatView({ sessionId, onConversationUpdate }: Props) {
               updated.mermaid_code = data;
             } else if (event === "tool_result") {
               try {
-                updated.tool_results = JSON.parse(data);
+                const inv = JSON.parse(data) as ToolInvocation;
+                updated.tool_invocations = [
+                  ...(updated.tool_invocations ?? []),
+                  inv,
+                ];
               } catch {
                 /* noop */
               }
@@ -263,6 +270,9 @@ function MessageBubble({
               {message.mermaid_code && (
                 <MermaidRenderer code={message.mermaid_code} />
               )}
+              {message.tool_invocations && message.tool_invocations.length > 0 && (
+                <ToolInvocationsList invocations={message.tool_invocations} />
+              )}
               {message.citations.length > 0 && (
                 <CitationsList citations={message.citations} />
               )}
@@ -290,6 +300,95 @@ function MessageBubble({
       </div>
     </div>
   );
+}
+
+function ToolInvocationsList({ invocations }: { invocations: ToolInvocation[] }) {
+  return (
+    <div className="mt-4 space-y-2">
+      <div className="flex items-center gap-1.5 text-xs font-medium text-ink-400">
+        <Wrench className="w-3.5 h-3.5" />
+        <span>工具调用 ({invocations.length})</span>
+      </div>
+      <div className="space-y-2">
+        {invocations.map((inv, i) => (
+          <ToolInvocationCard key={i} invocation={inv} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ToolInvocationCard({ invocation }: { invocation: ToolInvocation }) {
+  const isError = invocation.status === "error";
+  const argsPreview = formatArgsOneLine(invocation.args);
+  const body = isError ? invocation.error ?? "未知错误" : invocation.result ?? "";
+
+  return (
+    <details
+      className={`group rounded-lg border text-sm ${
+        isError
+          ? "border-red-200 bg-red-50/40"
+          : "border-cream-300 bg-cream-50/60"
+      }`}
+    >
+      <summary className="cursor-pointer select-none flex items-center gap-2 px-3 py-2">
+        {isError ? (
+          <XCircle className="w-4 h-4 text-red-500 shrink-0" />
+        ) : (
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+        )}
+        <code className="font-mono text-[13px] text-ink-700 font-medium">
+          {invocation.name}
+        </code>
+        <span className="text-xs text-ink-400 truncate flex-1 min-w-0">
+          {argsPreview}
+        </span>
+      </summary>
+      <div className="px-3 pb-3 pt-1 space-y-2 border-t border-cream-300/60">
+        {Object.keys(invocation.args).length > 0 && (
+          <div>
+            <div className="text-[11px] uppercase tracking-wide text-ink-400 mb-1">
+              参数
+            </div>
+            <pre className="text-xs bg-cream-100/80 rounded p-2 overflow-x-auto text-ink-600 whitespace-pre-wrap break-all">
+              {JSON.stringify(invocation.args, null, 2)}
+            </pre>
+          </div>
+        )}
+        <div>
+          <div className="text-[11px] uppercase tracking-wide text-ink-400 mb-1">
+            {isError ? "错误" : "返回摘要"}
+          </div>
+          <pre
+            className={`text-xs rounded p-2 overflow-x-auto whitespace-pre-wrap break-all ${
+              isError
+                ? "bg-red-50 text-red-700"
+                : "bg-cream-100/80 text-ink-600"
+            }`}
+          >
+            {body || "(空)"}
+          </pre>
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function formatArgsOneLine(args: Record<string, unknown>): string {
+  const keys = Object.keys(args);
+  if (keys.length === 0) return "(无参数)";
+  const parts = keys.slice(0, 3).map((k) => {
+    const v = args[k];
+    const repr =
+      typeof v === "string"
+        ? v.length > 30
+          ? `"${v.slice(0, 30)}…"`
+          : `"${v}"`
+        : JSON.stringify(v);
+    return `${k}=${repr}`;
+  });
+  if (keys.length > 3) parts.push("…");
+  return parts.join(", ");
 }
 
 function CitationsList({ citations }: { citations: Citation[] }) {

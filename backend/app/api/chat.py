@@ -3,7 +3,7 @@
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -13,14 +13,14 @@ from sse_starlette.sse import EventSourceResponse
 
 from app.db.database import async_session_factory, get_db
 from app.graph.builder import app_graph
-from app.graph.edges import route_after_generation
+from app.graph.edges import _has_external_mcp_servers
 from app.graph.nodes import (
     GENERATOR_SYSTEM_PROMPT,
+    TOOL_AGENT_SYSTEM_PROMPT,
     _extract_text,
     _get_llm,
     _get_mcp_tools,
     _infer_diagram_type,
-    dispatcher_node,
 )
 from app.graph.titles import schedule_title_generation
 from app.models.db_models import Conversation, Feedback, Session as SessionModel
@@ -310,19 +310,22 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                     except Exception as e:
                         logger.error(f"并行 mermaid 失败: {e}")
 
-                # ===== Stage 6: 微信推送（需要正文，串行 OK） =====
+                # ===== Stage 6: 工具调用（互斥：显式微信推送 vs LLM 自主调用外部 MCP） =====
                 if request.need_dispatch:
-                    dispatcher_out = await dispatcher_node({
-                        "query": request.query,
-                        "need_visualization": False,
-                        "need_dispatch": True,
-                        "generated_content": final_content,
-                    })
-                    tool_results = dispatcher_out.get("tool_results") or {}
-                    if tool_results:
+                    async for invocation in _stream_wechat_dispatch(
+                        request.query, final_content
+                    ):
                         yield {
                             "event": "tool_result",
-                            "data": json.dumps(tool_results, ensure_ascii=False),
+                            "data": json.dumps(invocation, ensure_ascii=False),
+                        }
+                elif _has_external_mcp_servers():
+                    async for invocation in _stream_autonomous_tools(
+                        request.query, final_content
+                    ):
+                        yield {
+                            "event": "tool_result",
+                            "data": json.dumps(invocation, ensure_ascii=False),
                         }
 
             except Exception as e:
@@ -331,6 +334,114 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                 yield {"event": "error", "data": str(e)}
 
     return EventSourceResponse(event_generator())
+
+
+# SSE tool_result 事件载荷上限：避免大返回阻塞流 / 撑爆前端
+_TOOL_RESULT_PREVIEW_LIMIT = 2000
+# 内置工具集合：已被其他直通路径处理（mermaid 并行、wechat 显式），不进入 LLM 自主决策
+_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset({"generate_mermaid", "send_wechat"})
+
+
+def _truncate_preview(text: str, limit: int = _TOOL_RESULT_PREVIEW_LIMIT) -> str:
+    """截断超长文本并附省略号，避免单个工具结果撑爆 SSE 单帧。"""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…(已截断，原文 {len(text)} 字符)"
+
+
+async def _stream_wechat_dispatch(
+    query: str, generated_content: str
+) -> AsyncGenerator[dict[str, Any], None]:
+    """显式微信推送路径：直接调用 send_wechat，按 per-tool 形态 yield 调用记录。"""
+    tools = await _get_mcp_tools()
+    tool = tools.get("send_wechat")
+    if tool is None:
+        return
+    args = {"content": (generated_content[:1500] if generated_content else query)}
+    try:
+        result = await tool.ainvoke(args)
+        yield {
+            "name": "send_wechat",
+            "args": args,
+            "status": "success",
+            "result": _truncate_preview(_extract_text(result), 500),
+        }
+    except Exception as e:
+        logger.error(f"send_wechat 失败: {e}", exc_info=True)
+        yield {
+            "name": "send_wechat",
+            "args": args,
+            "status": "error",
+            "error": str(e),
+        }
+
+
+async def _stream_autonomous_tools(
+    query: str, generated_content: str
+) -> AsyncGenerator[dict[str, Any], None]:
+    """LLM 自主调用外部 MCP 工具（如 github），按调用顺序 yield 结果。
+
+    - 只暴露非内置工具给 LLM，避免与并行 mermaid / 显式 wechat 路径打架。
+    - 每个 tool_call 独立 yield 一次：success 携带截断后的 result 摘要，error 携带 message。
+    """
+    tools_dict = await _get_mcp_tools()
+    external_tools = {
+        n: t for n, t in tools_dict.items() if n not in _BUILTIN_TOOL_NAMES
+    }
+    if not external_tools:
+        return
+
+    prompt = TOOL_AGENT_SYSTEM_PROMPT.format(
+        query=query,
+        need_visualization=False,
+        need_dispatch=False,
+        generated_content=generated_content[:1500],
+    )
+    try:
+        llm_with_tools = _get_llm().bind_tools(list(external_tools.values()))
+        response = await llm_with_tools.ainvoke([HumanMessage(content=prompt)])
+    except Exception as e:
+        logger.error(f"LLM 工具决策失败: {e}", exc_info=True)
+        return
+
+    tool_calls = getattr(response, "tool_calls", []) or []
+    if not tool_calls:
+        return
+
+    logger.info(
+        f"LLM 决定调用 {len(tool_calls)} 个外部工具: "
+        f"{[c.get('name') for c in tool_calls]}"
+    )
+    for call in tool_calls:
+        name = call.get("name", "")
+        args = call.get("args", {}) or {}
+        tool = external_tools.get(name)
+        if tool is None:
+            yield {
+                "name": name,
+                "args": args,
+                "status": "error",
+                "error": "tool not found",
+            }
+            continue
+        try:
+            result = await tool.ainvoke(args)
+            text_result = _extract_text(result)
+            yield {
+                "name": name,
+                "args": args,
+                "status": "success",
+                "result": _truncate_preview(text_result),
+            }
+            logger.info(f"自主调用 {name} 成功 (result_len={len(text_result)})")
+        except Exception as e:
+            logger.error(f"自主调用 {name} 失败: {e}", exc_info=True)
+            yield {
+                "name": name,
+                "args": args,
+                "status": "error",
+                "error": str(e),
+            }
 
 
 async def _call_mermaid_with_context(query: str, retrieved_docs: list) -> str:
