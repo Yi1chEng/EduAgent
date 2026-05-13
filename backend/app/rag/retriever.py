@@ -4,10 +4,13 @@
 - 关键词层：在 over-fetched 候选内，用查询中的关键词命中数排序
 - 融合：Reciprocal Rank Fusion（RRF, k=RAG_RRF_K）
 - 可选 reranker：若 RERANKER_API_KEY 已配置，调用 SiliconFlow bge-reranker 二次排序
+
+评估接入：retrieve_detailed() 返回各阶段中间结果，配合 RetrievalConfig 可做 ablation 实验。
 """
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
@@ -17,6 +20,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db.database import async_session_factory
 from app.rag.embeddings import embed_text
+
+
+@dataclass(frozen=True)
+class RetrievalConfig:
+    """检索 ablation 配置：关闭某层即模拟单一组件的检索质量。"""
+
+    use_keyword: bool = True
+    use_rrf: bool = True
+    use_reranker: bool = True
+    use_chapter_filter: bool = True
+    overfetch_multiplier: Optional[int] = None  # None 则用 settings.RAG_OVERFETCH_MULTIPLIER
+    rrf_k: Optional[int] = None  # None 则用 settings.RAG_RRF_K
+
+
+DEFAULT_CONFIG = RetrievalConfig()
 
 logger = logging.getLogger(__name__)
 
@@ -136,28 +154,30 @@ async def _rerank(query: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]
     return reranked
 
 
-async def retrieve(
+async def retrieve_detailed(
     query: str,
     top_k: int = 5,
+    config: RetrievalConfig = DEFAULT_CONFIG,
     db: AsyncSession | None = None,
-) -> list[dict[str, Any]]:
-    """混合检索：向量召回 + 关键词召回 → RRF 融合 → 可选 reranker。
+) -> dict[str, list[dict[str, Any]]]:
+    """与 retrieve() 等价，但返回各阶段中间结果用于评估/调试。
 
-    Args:
-        query: 用户查询文本。
-        top_k: 最终返回数量。
-        db: 可选的数据库会话；未传入时自动创建。
-
-    Returns:
-        检索结果列表，每个元素包含 text, source_file, heading_path, chunk_index, score。
+    返回 dict 的 key:
+        vector    : 向量层召回结果（按 cosine 距离升序，等价于"vector-only top-k"）
+        keyword   : 关键词层重排结果（仅在候选集内，0 分文档已过滤）
+        fused     : RRF 融合后的列表
+        reranked  : 交叉 reranker 二次排序后的列表（未启用 reranker 时 == fused）
+        final     : 截断到 top_k 后的最终结果（等价于 retrieve() 的返回）
     """
     settings = get_settings()
-    overfetch = max(top_k, top_k * settings.RAG_OVERFETCH_MULTIPLIER)
+    multiplier = config.overfetch_multiplier or settings.RAG_OVERFETCH_MULTIPLIER
+    rrf_k = config.rrf_k or settings.RAG_RRF_K
+    overfetch = max(top_k, top_k * multiplier)
 
     query_embedding = await embed_text(query)
     embedding_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
 
-    chapter_filter = _detect_chapter_filter(query)
+    chapter_filter = _detect_chapter_filter(query) if config.use_chapter_filter else None
     if chapter_filter:
         logger.info(f"检测到章节过滤条件: {chapter_filter}")
         sql = text("""
@@ -215,28 +235,66 @@ async def retrieve(
             candidates = await _execute(session)
 
     if not candidates:
-        return []
+        empty: list[dict[str, Any]] = []
+        return {"vector": empty, "keyword": empty, "fused": empty, "reranked": empty, "final": empty}
 
-    # 关键词层：在候选集内按关键词命中重新排
-    keywords = _extract_keywords(query)
-    if keywords:
-        scored = [
-            (_keyword_score(c["text"], keywords), c) for c in candidates
-        ]
-        keyword_ranked = [
-            c for s, c in sorted(scored, key=lambda x: x[0], reverse=True) if s > 0
-        ]
+    # 关键词层
+    if config.use_keyword:
+        keywords = _extract_keywords(query)
+        if keywords:
+            scored = [
+                (_keyword_score(c["text"], keywords), c) for c in candidates
+            ]
+            keyword_ranked = [
+                c for s, c in sorted(scored, key=lambda x: x[0], reverse=True) if s > 0
+            ]
+        else:
+            keyword_ranked = []
     else:
         keyword_ranked = []
 
-    fused = _rrf_fuse(candidates, keyword_ranked, k=settings.RAG_RRF_K)
+    # RRF 融合（关闭时直接退化为向量序）
+    if config.use_rrf and keyword_ranked:
+        fused = _rrf_fuse(candidates, keyword_ranked, k=rrf_k)
+    else:
+        fused = list(candidates)
 
-    # 截断到 top_k * 2 后再交给（可选的）reranker，避免重排过多
+    # Reranker（关闭或未配置时透传 fused）
     pre_rerank = fused[: max(top_k * 2, top_k)]
-    reranked = await _rerank(query, pre_rerank)
+    if config.use_reranker:
+        reranked = await _rerank(query, pre_rerank)
+    else:
+        reranked = pre_rerank
 
     final = reranked[:top_k]
     logger.info(
-        f"混合检索: 候选 {len(candidates)} → 融合 {len(fused)} → 重排 {len(reranked)} → 返回 {len(final)}"
+        f"混合检索({config}): 候选 {len(candidates)} → 融合 {len(fused)} → 重排 {len(reranked)} → 返回 {len(final)}"
     )
-    return final
+    return {
+        "vector": candidates,
+        "keyword": keyword_ranked,
+        "fused": fused,
+        "reranked": reranked,
+        "final": final,
+    }
+
+
+async def retrieve(
+    query: str,
+    top_k: int = 5,
+    db: AsyncSession | None = None,
+    config: RetrievalConfig = DEFAULT_CONFIG,
+) -> list[dict[str, Any]]:
+    """混合检索：向量召回 + 关键词召回 → RRF 融合 → 可选 reranker。
+
+    Args:
+        query: 用户查询文本。
+        top_k: 最终返回数量。
+        db: 可选的数据库会话；未传入时自动创建。
+        config: 检索 ablation 配置（默认启用所有层）。
+
+    Returns:
+        检索结果列表，每个元素包含 text, source_file, heading_path, chunk_index, score。
+    """
+    stages = await retrieve_detailed(query, top_k=top_k, config=config, db=db)
+    return stages["final"]
