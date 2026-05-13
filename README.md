@@ -1,111 +1,637 @@
-# EduAgent — 教育智能体
+# EduAgent — 教育领域 RAG + MCP 多 Agent 系统
 
-基于 RAG + LangGraph + MCP 的教育领域 AI 助手。  
-后端 FastAPI，向量库 PostgreSQL+pgvector，LLM 默认 ModelScope Qwen3-235B，Embedding 默认 SiliconFlow bge-m3。
-
----
-
-## 架构
-
-```
-用户 → FastAPI ─► LangGraph 编排
-                  rag_retriever ──► generator ──► [dispatcher (LLM 驱动 MCP)]
-                       │                              │
-                       ▼                              ▼
-                  pgvector                 内置 mcp_server (mermaid/wechat)
-                                           ＋ 外部 MCP servers (mcp_servers.json)
-```
-
-- **RAG**：Markdown 教材按标题切块 → bge-m3 向量化 → pgvector 余弦检索 → 自动引用 `[1][2]`
-- **生成**：单次 LLM 调用，禁止在正文嵌入 mermaid（图由工具生成）
-- **MCP 工具**：
-  - 内置：`generate_mermaid`（LLM 生成 DSL）、`send_wechat`（企业微信推送）
-  - 外部：通过 `mcp_servers.json` 接入任意 npx/python MCP server（filesystem、fetch、github 等）
-  - 调度：LLM `bind_tools` 自主决定调用哪些工具
+> 基于 LangGraph 编排 + 混合检索 RAG + MCP 工具生态的教育智能体。
+> 后端 FastAPI(异步 / SSE 流式),向量库 PostgreSQL+pgvector,LLM 默认 ModelScope Qwen3-30B-A3B,Embedding 默认 SiliconFlow bge-m3。
 
 ---
 
-## 项目结构
+## 目录
+
+- [一、核心特性](#一核心特性)
+- [二、整体架构](#二整体架构)
+- [三、技术选型](#三技术选型)
+- [四、项目结构](#四项目结构)
+- [五、后端文件详解](#五后端文件详解)
+- [六、关键功能处理流程](#六关键功能处理流程)
+- [七、数据模型](#七数据模型)
+- [八、API 参考](#八api-参考)
+- [九、MCP 工具生态](#九mcp-工具生态)
+- [十、配置与环境变量](#十配置与环境变量)
+- [十一、快速启动](#十一快速启动)
+- [十二、前端(简略)](#十二前端简略)
+- [十三、运维与排障](#十三运维与排障)
+- [十四、路线图](#十四路线图)
+- [十五、License](#十五license)
+
+---
+
+## 一、核心特性
+
+- **教学场景 RAG**:Markdown 教材按标题切分 → bge-m3 向量化 → pgvector HNSW 索引 → **混合检索(向量召回 + 关键词召回 + RRF 融合 + 可选 reranker)**,回答自动附 `[1][2]` 来源引用。
+- **LangGraph 编排**:`rag_retriever → generator → dispatcher` 三节点,条件边按需路由,统一同步 / 流式两套接口。
+- **真·SSE token 流式**:从 RAG 命中到工具调用,逐事件推送(`citation` / `token` / `mermaid` / `tool_result` / `done` / `error`),首字延迟即 LLM 的 TTFT。
+- **MCP 工具生态**:
+  - 内置 `generate_mermaid`(LLM 生成图表 DSL,带语法兜底自动修复)、`send_wechat`(企业微信 Webhook 推送)。
+  - 外部任意 MCP server 通过 `mcp_servers.json` 一行接入(`@modelcontextprotocol/server-github`、`fetch`、`filesystem` 等)。
+  - 配置文件 `env` / `args` 支持 `${VAR}` 占位符,密钥从环境变量解析,**缺失时安全跳过该 server 并告警**。
+  - LLM `bind_tools` 自主决定调用哪些外部工具。
+- **每次工具调用单独 SSE 推送**:前端按 `{name, args, status, result|error}` 渲染折叠卡片,展示调用名、参数、返回摘要。
+- **可视化 / 推送 / 外部工具三个开关**:聊天框上端并排,默认外部工具开启、其他关闭。
+- **持久化工件**:`mermaid_code` 与 `tool_invocations` 落盘到 `conversations` 表,会话切走再切回仍能完整重放。
+- **会话标题自动生成**:首轮对话完成后 fire-and-forget 调用 LLM,12 字内主题概括。
+- **MCP 工具预热**:lifespan 启动时 fork stdio 子进程并拉取工具列表,首请求省 1-3 秒。
+- **Embedding 单 query TTL+LRU 缓存**:重复查询零外部 API 开销。
+- **启发式 RAG 路由**:闲聊 / 元问题 / 短查询自动跳过 RAG,零额外 LLM 调用。
+- **章节定向检索**:查询中带"第三章"等关键词时,WHERE 子句过滤源文件名,提高召回相关性。
+
+---
+
+## 二、整体架构
+
+```
+                       ┌───────────────────────────┐
+                       │  前端 React + Vite + TS   │
+                       │  (SSE 解析 / Mermaid 渲染)│
+                       └─────────────┬─────────────┘
+                                     │ /api/*  (Vite 代理或同源部署)
+                                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│                       FastAPI 后端 (Uvicorn)                   │
+│                                                                │
+│   ┌──────────────┐   ┌──────────────────────────────────────┐  │
+│   │ API 路由层   │   │  LangGraph 状态图                    │  │
+│   │ chat / kb /  │──►│  rag_retriever → generator → ?       │  │
+│   │ feedback     │   │            ?: dispatcher (LLM 工具)  │  │
+│   └──────┬───────┘   └──────┬──────────────┬────────────────┘  │
+│          │                  │              │                   │
+│   ┌──────▼───────┐  ┌───────▼──────┐ ┌─────▼─────────────┐     │
+│   │  RAG 模块    │  │  Embedding   │ │   MCP 客户端       │    │
+│   │  混合检索 +  │  │  bge-m3 +    │ │  (langchain-mcp-   │    │
+│   │  RRF + rerank│  │  TTL 缓存    │ │   adapters)        │    │
+│   └──────┬───────┘  └──────────────┘ └─────┬─────────────┘     │
+│          │                                 │                   │
+└──────────┼─────────────────────────────────┼───────────────────┘
+           ▼                                 ▼
+   ┌───────────────┐                  ┌─────────────────────┐
+   │ PostgreSQL 16 │                  │ 内置 MCP Server     │
+   │  + pgvector   │                  │ (stdio 子进程)      │
+   │   HNSW 索引   │                  │  - generate_mermaid │
+   │  3 张表       │                  │  - send_wechat      │
+   └───────────────┘                  └─────────────────────┘
+                                                ▲
+                                                │ stdio
+                                      ┌─────────┴─────────────┐
+                                      │ 外部 MCP servers      │
+                                      │  - github             │
+                                      │  - fetch              │
+                                      │  - filesystem ...     │
+                                      └───────────────────────┘
+```
+
+请求流向(以 `/api/chat/stream` 为例):
+
+```
+client ──POST─► /chat/stream
+                 │
+                 ├─ Stage 1  并行启动:RAG 检索(可选) + 写 user 消息到 DB
+                 ├─ Stage 2  立即推 SSE event: citation
+                 ├─ Stage 3  并行启动 mermaid 任务(若 need_visualization)
+                 ├─ Stage 4  LLM astream → 逐 token SSE event: token
+                 ├─ Stage 5  保存 assistant 消息 → SSE event: done(含 conversation_id)
+                 ├─ Stage 6  等 mermaid 任务结束 → SSE event: mermaid
+                 ├─ Stage 7  工具调用(互斥):
+                 │            ├─ need_dispatch=True → 调 send_wechat
+                 │            └─ allow_external_tools && 有外部 MCP → LLM 自主决策
+                 │                                    每个工具调用单独推 tool_result event
+                 └─ Stage 8  把 mermaid_code / tool_invocations 二次 commit 到 assistant 行
+```
+
+---
+
+## 三、技术选型
+
+### 后端
+
+| 类别 | 选型 | 理由 |
+|---|---|---|
+| Web 框架 | **FastAPI 0.115** | 原生 async / 自动 OpenAPI / Pydantic 校验 / 性能优秀 |
+| ASGI 服务器 | Uvicorn 0.30 (`--reload`) | 开发热重载,生产可换 gunicorn+uvicorn worker |
+| 校验/配置 | Pydantic 2.9 + pydantic-settings 2.5 | 类型安全的 schema 和 `.env` 加载 |
+| ORM | SQLAlchemy 2.0 async + asyncpg 0.29 | 现代异步 ORM,与 FastAPI 异步链路一致 |
+| 向量库 | **PostgreSQL 16 + pgvector 0.3.5** | 单库即可,HNSW 索引 O(log N) 检索,运维心智成本低于专用向量库 |
+| LLM 客户端 | langchain-openai 0.2 | 兼容任意 OpenAI 协议端点(ModelScope / SiliconFlow / DeepSeek / OpenAI 原厂) |
+| 编排框架 | **LangGraph 0.2.39** | 显式状态机比隐式 agent 链路可调试,条件边天然支持 RAG 路由 |
+| MCP 客户端 | **langchain-mcp-adapters 0.0.3** | 一行 `MultiServerMCPClient` 接入多 server,与 LangChain Tool 接口打通 |
+| MCP Server | **FastMCP** (`mcp` 官方 SDK) | stdio 传输,Python 进程间隔离,工具热插拔 |
+| SSE | sse-starlette 2.1 | 真·token 流式,自动处理 CRLF / multiline data |
+| HTTP 客户端 | httpx 0.27 | 原生 async,reranker / wechat 推送复用 |
+| 文件上传 | python-multipart 0.0.12 | FastAPI 默认依赖 |
+
+### 前端
+
+| 类别 | 选型 |
+|---|---|
+| UI 框架 | React 18 + TypeScript 5.6 |
+| 构建 | Vite 5.4(开发代理 `/api → :8000`) |
+| 样式 | Tailwind CSS 3.4 + 自定义 cream/terracotta/ink 调色板 |
+| Markdown | react-markdown + remark-gfm |
+| Mermaid 渲染 | mermaid 11.4(SSR 关闭,按需 init) |
+| 图标 | lucide-react |
+
+### 模型默认配置
+
+| 角色 | 模型 | 端点 | 选型理由 |
+|---|---|---|---|
+| LLM | Qwen/Qwen3-30B-A3B-Instruct-2507 | ModelScope | 30B MoE,推理快、免费、教学问答稳定 |
+| Embedding | BAAI/bge-m3 (1024 维) | SiliconFlow | 中英文双语 SOTA,与 db_models `Vector(1024)` 强一致 |
+| Reranker(可选) | BAAI/bge-reranker-v2-m3 | SiliconFlow | 候选集二次排序,留空则不启用 |
+
+---
+
+## 四、项目结构
 
 ```
 EduAgent/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py            # FastAPI 入口
-│   │   ├── config.py          # Pydantic Settings
-│   │   ├── api/{chat, knowledge, feedback}.py
-│   │   ├── graph/{state, nodes, edges, builder}.py
-│   │   ├── rag/{embeddings, retriever, citation, knowledge_loader}.py
-│   │   ├── models/{schemas, db_models}.py
-│   │   └── db/{database, init_db}.py
-│   ├── Dockerfile             # Python + Node.js (用于 npx MCP servers)
+│   │   ├── main.py             # FastAPI 入口、CORS、lifespan 预热
+│   │   ├── config.py           # Pydantic Settings 单例
+│   │   ├── api/
+│   │   │   ├── chat.py         # 对话:同步/流式/会话管理 (~800 行,核心)
+│   │   │   ├── knowledge.py    # 知识库上传/列表/删除
+│   │   │   └── feedback.py     # 反馈提交
+│   │   ├── graph/
+│   │   │   ├── builder.py      # StateGraph 编译
+│   │   │   ├── state.py        # AgentState TypedDict
+│   │   │   ├── nodes.py        # rag_retriever / generator / dispatcher
+│   │   │   ├── edges.py        # 条件路由 (是否走 dispatcher)
+│   │   │   └── titles.py       # 会话标题异步生成
+│   │   ├── rag/
+│   │   │   ├── retriever.py    # 混合检索:向量+关键词+RRF+rerank
+│   │   │   ├── embeddings.py   # bge-m3 + TTL+LRU 缓存
+│   │   │   ├── knowledge_loader.py # Markdown → 标题切分 → embedding → 入库
+│   │   │   └── citation.py     # 引用格式化
+│   │   ├── models/
+│   │   │   ├── db_models.py    # SQLAlchemy ORM: KnowledgeChunk/Conversation/Session/Feedback
+│   │   │   └── schemas.py      # Pydantic 请求/响应
+│   │   └── db/
+│   │       ├── database.py     # async engine / session factory
+│   │       └── init_db.py      # 启用 pgvector / 创建表 / 幂等 ALTER / 建索引
+│   ├── Dockerfile              # Python 3.11 + Node.js 22 (npx 启动 npm-based MCP)
 │   └── requirements.txt
-├── mcp_server/                # 内置 MCP，stdio 子进程
-│   ├── server.py              # FastMCP 入口
-│   └── tools/{mermaid, wechat}.py
-├── mcp_servers.json           # 外部 MCP server 配置
-├── frontend/                  # 待开发
-├── docker-compose.yml
-└── README.md
+├── mcp_server/                 # 内置 MCP server (stdio 子进程)
+│   ├── server.py               # FastMCP 入口
+│   └── tools/
+│       ├── mermaid.py          # generate_mermaid:LLM 生成 DSL + 危险字符自动修复
+│       └── wechat.py           # send_wechat:企业微信 Webhook
+├── mcp_servers.json            # 外部 MCP server 配置 (${VAR} 占位符)
+├── frontend/                   # React SPA
+│   └── src/
+│       ├── App.tsx
+│       ├── components/{ChatView,Sidebar,MermaidRenderer,KnowledgePanel}.tsx
+│       └── lib/{api,types}.ts
+├── docker-compose.yml          # postgres + backend (volume 挂载源码/MCP)
+└── README.md                   (本文档)
 ```
 
 ---
 
-## 快速启动
+## 五、后端文件详解
 
-```bash
-# 1. 配置环境变量
-cp backend/.env.example backend/.env
-# 编辑 backend/.env，至少填 LLM_API_KEY 和 EMBEDDING_API_KEY
+### 5.1 `app/main.py`(入口)
 
-# 2. 启动
-docker compose up -d --build
+- 创建 `FastAPI` 实例,挂载 CORS 中间件(开发期 `*`,关闭 credentials)、注册三个路由(`chat` / `knowledge` / `feedback`)、`/` 与 `/health` 健康检查。
+- `lifespan` 启动阶段做三件事:
+  1. `init_database()`:启用 `vector` 扩展、`Base.metadata.create_all`、幂等 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`(用于灰度发布新字段)、建 HNSW 与复合索引。
+  2. `_get_embeddings_model()` 同步构造客户端,避免首请求阻塞 event loop。
+  3. `_get_mcp_tools()` fork stdio 子进程并 `ListToolsRequest`,把工具表加载到全局缓存,首请求省 1-3s。
+- 关闭阶段记录日志即可,无显式连接清理(SQLAlchemy / httpx 客户端自动 GC)。
 
-# 3. 上传知识库（Markdown 教材）
-curl -X POST http://localhost:8000/api/knowledge/upload -F "file=@第一章.md"
+### 5.2 `app/config.py`(配置)
 
-# 4. 对话
-curl -X POST http://localhost:8000/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"query":"请总结第一章","session_id":"s1"}'
-```
+- `pydantic_settings.BaseSettings` 从 `.env` 加载,`extra="ignore"` 容忍多余键。
+- `@lru_cache` 的 `get_settings()` 让全应用共享一个 `Settings` 实例。
+- 关键字段:`LLM_*` / `EMBEDDING_*` / `RERANKER_*`(可选) / `DATABASE_URL` / `WECHAT_WEBHOOK_URL` / `MCP_SERVER_COMMAND` / `MCP_SERVER_ARGS` / `RAG_OVERFETCH_MULTIPLIER`(默认 4) / `RAG_RRF_K`(默认 60) / `UPLOAD_DIR`。
 
-API 文档：http://localhost:8000/docs
+### 5.3 `app/db/database.py`(连接管理)
+
+- `create_async_engine(DATABASE_URL, pool_size=10, max_overflow=20)`。
+- `async_sessionmaker(expire_on_commit=False)`,**这点很关键**:`/chat/stream` 在 `done` 之后会二次 commit 写 `mermaid_code` / `tool_invocations_json`,需要 ORM 对象在 commit 后仍可用。
+- `get_db()` 是 FastAPI 依赖,**不可用于 SSE 端点**(FastAPI 会在 `return EventSourceResponse(...)` 时立刻关 session,但 generator 才刚开始迭代)。流式端点改在 generator 内部用 `async with async_session_factory()`。
+
+### 5.4 `app/db/init_db.py`(启动初始化)
+
+- 启用 pgvector 扩展。
+- `Base.metadata.create_all`:只在表不存在时建表。
+- 幂等列补齐(本项目未接 Alembic,以 `ADD COLUMN IF NOT EXISTS` 兜底,适合早期单人项目):
+  ```sql
+  ALTER TABLE conversations
+    ADD COLUMN IF NOT EXISTS mermaid_code TEXT,
+    ADD COLUMN IF NOT EXISTS tool_invocations_json TEXT;
+  ```
+- 建 HNSW 向量索引(cosine ops)与 `(session_id, created_at DESC)` 复合索引(覆盖 `_load_history` 与 `list_sessions`)。
+
+### 5.5 `app/models/db_models.py`(ORM 模型)
+
+| 表 | 主要字段 | 备注 |
+|---|---|---|
+| `knowledge_chunks` | `id` / `source_file` / `heading_path` / `chunk_index` / `original_text` / `embedding Vector(1024)` / `created_at` | HNSW 索引在 `embedding` 上 |
+| `sessions` | `session_id PK` / `title` / `created_at` / `updated_at` | 标题由 `titles.py` 异步写入 |
+| `conversations` | `id` / `session_id` / `role` / `content` / `citations_json` / `mermaid_code` / `tool_invocations_json` / `created_at` | 后两列承载工件持久化 |
+| `feedbacks` | `id` / `conversation_id` / `rating(±1)` / `comment` / `prompt` / `response` / `created_at` | 同时落盘 prompt 与 response 便于微调采样 |
+
+### 5.6 `app/models/schemas.py`(Pydantic Schema)
+
+- `ChatRequest`:`query` / `session_id` / `need_visualization` / `need_dispatch` / `allow_external_tools`(默认 True)。
+- `ChatResponse`:`conversation_id` / `content` / `citations` / `mermaid_code` / `tool_results`。
+- `SessionListItem`:`title` / `last_message`(80 字预览) / `last_role` / `message_count` / `updated_at`。
+- `MessageItem`:历史消息,含 `mermaid_code` 与 `tool_invocations`(用于切回会话时重放工件)。
+- `FeedbackRequest`:`conversation_id` / `rating(1|-1)` / `comment`。
+
+### 5.7 `app/graph/state.py`
+
+`AgentState` 是 `TypedDict(total=False)`,LangGraph 节点共享:`messages` / `query` / `retrieved_docs` / `citations` / `generated_content` / `tool_results` / `need_visualization` / `need_dispatch` / `mermaid_code` / `session_id`。
+
+### 5.8 `app/graph/nodes.py`(三大节点)
+
+- `rag_retriever_node`:调 `retriever.retrieve(query, top_k=5)`,失败时返回空 docs 继续往下(不中断)。
+- `generator_node`:用 `GENERATOR_SYSTEM_PROMPT` 拼系统提示 + 最近 10 条 history + 当前 query,`llm.ainvoke` 一次性返回正文。提示词**硬性禁止**在正文嵌入 mermaid,图由独立工具调用产出。
+- `dispatcher_node`:策略
+  - `need_visualization=True` → 直接调 `generate_mermaid`,**绕过 LLM 决策**,把完整 query+正文当 description 传入(防止 LLM 自己提炼缩水)。
+  - `need_dispatch=True` → 直接调 `send_wechat`。
+  - 都为 False 且有外部 MCP → LLM `bind_tools` 自主决定。
+- 同模块还有:
+  - `_get_llm()`(延迟初始化的 `ChatOpenAI` 单例)。
+  - `_get_mcp_tools()`:聚合内置 `eduagent` MCP + 外部 MCP 的工具,缓存为 `{name: tool}`。
+  - `_load_external_mcp_servers()`:从 `mcp_servers.json` 读外部 server 配置,过滤 `_` 前缀,**展开 `${VAR}` 占位符**;变量缺失时跳过该 server 并打印警告,避免子进程启动后才报错。
+  - `_extract_text(result)`:把 MCP 返回的 `list[TextContent]` / dict / str 统一拍平为纯字符串。
+  - `_infer_diagram_type(query)`:简易关键词匹配 `mindmap` / `timeline` / `classDiagram` / `sequenceDiagram` / `flowchart`(默认)。
+
+### 5.9 `app/graph/edges.py`
+
+- `_has_external_mcp_servers()`(`lru_cache`):扫一遍 `mcp_servers.json`,只要有非 `_` 前缀的 key 就返回 True。
+- `route_after_generation`:`need_viz` / `need_dispatch` / 有外部 MCP 任一为真 → `dispatcher`,否则 `end`。
+
+### 5.10 `app/graph/builder.py`
+
+- 装配 `StateGraph(AgentState)`,加节点、加边、`set_entry_point("rag_retriever")`、添加从 `generator` 出发的条件边。
+- 模块加载时即 `app_graph = build_graph()`,API 层 `await app_graph.ainvoke(state)` 启动。
+
+### 5.11 `app/graph/titles.py`(会话标题)
+
+- `_TITLE_SYSTEM_PROMPT`:让 LLM 用 ≤12 字概括,直接输出标题。
+- `_clean_title`:去引号 / 标点 / 空白,截到 24 字。
+- `schedule_title_generation(session_id, first_query)`:**fire-and-forget**,`asyncio.create_task`。失败仅记日志,不阻塞主请求。在两个 chat 端点中,**仅当 `is_first_turn=True`** 时调度。
+
+### 5.12 `app/rag/embeddings.py`
+
+- `_get_embeddings_model()` 延迟初始化 `OpenAIEmbeddings`。
+- `embed_text(text)`:**自带 OrderedDict TTL+LRU 缓存**(`maxsize=512`、`ttl=600s`)。同样 query 命中 0 外部 API。
+- `embed_batch(texts, batch_size=32)`:按批调 `aembed_documents`,避免单次过大被 API 拒。
+
+### 5.13 `app/rag/knowledge_loader.py`
+
+- `_split_by_headings`:扫描 `#` / `##`,按一/二级标题切语义段,`heading_path` 写成 `第一章 > 1.2 牛顿定律`。
+- `_secondary_split`:若段落 > 512 字符,按 `\n\n` 二次切分,带 64 字符 overlap;若仍超长则按字符硬切。
+- `load_file(file_path, db)`:read → split → `embed_batch` → `db.add_all`。返回 chunk 数。
+
+### 5.14 `app/rag/retriever.py`(混合检索核心)
+
+- **章节定向**:`_detect_chapter_filter` 匹配 `第X章`,把 LIKE 条件作为 SQL WHERE 加进去。
+- **向量层(over-fetch)**:`top_k * RAG_OVERFETCH_MULTIPLIER`(默认 4)个候选,`ORDER BY embedding <=> :q_emb`。
+- **关键词层**:`_extract_keywords` 抽 ≥2 字符 CJK / ASCII 单词,去停用片段;`_keyword_score` 按命中次数累加,候选集内重排。
+- **RRF 融合**:`_rrf_fuse` 给两条 rank 列表打 `1/(k+rank)` 分,以文档 id 为去重键,默认 `k=60`。
+- **可选 Reranker**:`RERANKER_API_KEY` 配置后调用 SiliconFlow `bge-reranker-v2-m3`,失败回退 RRF 顺序。
+- 返回 `[{id, text, source_file, heading_path, chunk_index, score}]`。
+
+### 5.15 `app/rag/citation.py`
+
+- `format_context`:把 docs 拼成 `[1] {text}\n\n[2] {text}` 喂给 LLM。
+- `format_citations`:拼 `[1] {source_file} > {heading_path}` 文本块。
+- `build_citation_list`:产出 API 响应用的结构化字典列表。
+
+### 5.16 `app/api/chat.py`(核心,约 800 行)
+
+划分为五层:
+
+1. **意图检测**
+   - `_detect_visualization_intent`:命中"流程图 / 脑图 / 思维导图 / mermaid"等关键词 → 自动开 `need_visualization`。
+   - `_needs_rag`:闲聊 / 元问题 / 极短查询 → 跳过 RAG,零额外 LLM 调用。
+2. **持久化辅助**
+   - `_save_conversation`:写一条 user / assistant 消息,支持 `citations_json` / `mermaid_code` / `tool_invocations_json`。
+   - `_load_history(limit=20)`:倒序拉再反转得正序 history,用于 LLM 上下文。
+3. **同步对话 `POST /chat`**:走完整 LangGraph,把 `mermaid_code` 直接落库,把老格式 `tool_results` 通过 `_legacy_tool_results_to_invocations` 转新数组形态再落库(契约统一)。
+4. **流式对话 `POST /chat/stream`**(`EventSourceResponse`):
+   - 八阶段流水线(见架构图)。
+   - 用独立 `async with async_session_factory()` 维持 session,**显式 commit 两次**:`done` 前提交正文 + citations、Stage 8 提交 mermaid + tool_invocations。
+   - mermaid 用 **`asyncio.create_task` 与正文流并行**,等正文写完再 `await mermaid_task`,使图表与正文几乎同时到达。
+   - 工具调用走两个 async generator:`_stream_wechat_dispatch` / `_stream_autonomous_tools`,每完成一次调用就 yield 一条 `tool_result` 事件。
+5. **会话管理**
+   - `GET /sessions`:单条 SQL 用 `DISTINCT ON` 取每 session 最后一条 + 窗口函数算总数 + `LEFT JOIN sessions` 拼标题,避免 N+1。
+   - `GET /sessions/{id}/messages`:正序拉所有消息,反序列化 `citations_json` / `tool_invocations_json`,把 `mermaid_code` 一并塞回响应。
+   - `DELETE /sessions/{id}`:先查 conversation_id,然后串联删 `feedbacks` / `conversations` / `sessions`。
+
+### 5.17 `app/api/knowledge.py`
+
+- `POST /knowledge/upload`:仅接受 `.md`,先 `DELETE WHERE source_file=?` 再调 `load_file` 实现"覆盖式更新"。
+- `GET /knowledge/list`:按文件名 group by 数 chunk。
+- `DELETE /knowledge/{doc_name}`:数 chunk → delete → 移除磁盘文件。
+
+### 5.18 `app/api/feedback.py`
+
+- 校验 `rating ∈ {1, -1}`。
+- 校验 `conversation_id` 是 assistant 消息;再回溯找同 session、`created_at <=` 它的最近一条 user 消息当作 prompt。
+- 把 `prompt+response` 一起入 `feedbacks` 表(冗余存,方便日后导出做 SFT 数据)。
+
+### 5.19 `mcp_server/server.py`
+
+- `FastMCP("eduagent-mcp-tools")`,挨个调 `register_mermaid` / `register_wechat` 注册工具,`stdio` 传输运行。
+
+### 5.20 `mcp_server/tools/mermaid.py`
+
+- `PROMPT_TEMPLATE` **极度详尽**:硬性语法规则(节点 ID 必须英文、危险字符自动包裹双引号)、丰富度要求(10-20 节点,3 层 mindmap),配 flowchart 与 mindmap 完整示例。
+- `_strip_fences`:剥 ```` ```mermaid ```` 围栏(防 LLM 偷偷加 markdown)。
+- `_sanitize_labels`:正则扫 `[...]` / `((...))` / `{{...}}` / `{...}`,标签内含 `( ) < > ; , & / \ :` 时**自动用双引号包**;LLM 经常忘的语法陷阱被强制兜底。
+- 失败时返回 `flowchart TD\n    A[生成失败: ...]` 兜底图,不抛异常。
+
+### 5.21 `mcp_server/tools/wechat.py`
+
+- 从 `WECHAT_WEBHOOK_URL` 环境变量读 webhook。
+- 支持 `text` / `markdown` 两种消息类型,httpx POST,errcode=0 视为成功。
 
 ---
 
-## API 总览
+## 六、关键功能处理流程
+
+### 6.1 流式对话 `POST /api/chat/stream`
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as chat_stream
+    participant DB as Postgres
+    participant RAG as retriever
+    participant LLM as ChatOpenAI
+    participant MCP as MCP tools
+
+    C->>API: POST {query, session_id, need_viz?, need_dispatch?, allow_external?}
+    par 并行
+        API->>RAG: retrieve(query, top_k=5)  [可选]
+    and
+        API->>DB: insert user message + commit
+    end
+    RAG-->>API: top_k docs
+    API->>C: event: citation
+    opt need_visualization
+        API->>MCP: generate_mermaid (并行 task)
+    end
+    API->>LLM: astream(messages)
+    loop 每个 token
+        LLM-->>API: chunk
+        API->>C: event: token
+    end
+    API->>DB: insert assistant message + commit
+    API->>C: event: done (conversation_id)
+    API->>C: schedule_title_generation (fire-and-forget)
+    Note over API: 等 mermaid task
+    API->>C: event: mermaid (若有)
+    alt need_dispatch
+        API->>MCP: send_wechat
+        API->>C: event: tool_result {name, args, status, result}
+    else allow_external_tools && has external MCP
+        API->>LLM: bind_tools().ainvoke()
+        LLM-->>API: tool_calls[]
+        loop 每个 tool_call
+            API->>MCP: tool.ainvoke(args)
+            API->>C: event: tool_result {...}
+        end
+    end
+    API->>DB: UPDATE assistant row set mermaid_code, tool_invocations_json + commit
+```
+
+**关键性能优化点**:
+
+- **RAG / user 消息写入并行**:`asyncio.gather` 不让 IO 串行等。
+- **mermaid 与正文 LLM 并行**:用 query + RAG context 直接当 mermaid description,**不等正文写完**就发起调用,图表到达时间几乎等于正文结束。
+- **token 真实流式**:`llm.astream()` 而非 `ainvoke()`,首字延迟 = TTFT 而非完整 latency。
+- **done 事件早发**:工件还没收齐就发 done + conversation_id,前端立刻能反馈/复制;mermaid / tool_result 异步追加。
+
+### 6.2 混合检索 `retriever.retrieve()`
+
+```
+query
+  ├─ embed_text → 1024-dim 向量          (TTL 缓存命中则秒返)
+  └─ _extract_keywords → ["牛顿", "第二定律", ...]
+        │
+        ▼
+  pgvector SQL: ORDER BY embedding <=> :q LIMIT top_k * 4
+        │
+        ▼ (over-fetch 候选, e.g. 20)
+  ┌─────────────────────────────────────────────┐
+  │ 向量序 vector_ranked  (按余弦距离)          │
+  │ 关键词序 keyword_ranked (按命中次数, 0分过滤)│
+  └─────────────────────────────────────────────┘
+        │
+        ▼  _rrf_fuse(k=60)   score_i = Σ 1 / (k + rank)
+  fused 列表 (按 RRF 分降序)
+        │
+        ▼  截断到 top_k * 2
+  pre_rerank
+        │
+        ▼  reranker?
+  ┌──── 有 ──── SiliconFlow bge-reranker-v2-m3
+  └──── 无 ──── 原样
+        │
+        ▼  取前 top_k
+  最终结果(带 score)
+```
+
+### 6.3 知识库导入 `POST /api/knowledge/upload`
+
+```
+multipart .md 文件
+  ↓
+保存到 uploads/{filename}
+  ↓
+DELETE conversations WHERE source_file = filename   (覆盖式更新)
+  ↓
+load_file:
+  read file → _split_by_headings (H1/H2)
+            → _secondary_split (>512 字符再切,64 字符 overlap)
+            → embed_batch (batch_size=32)
+            → db.add_all + flush
+  ↓
+返回 {message, source_file, chunks_count}
+```
+
+### 6.4 LLM 自主调用外部 MCP 工具
+
+```
+正文流结束 (done 已发)
+  ↓
+chat.py / _stream_autonomous_tools(query, generated_content)
+  ↓
+filter tools:排除 generate_mermaid / send_wechat(避免与内置直通路径冲突)
+  ↓
+TOOL_AGENT_SYSTEM_PROMPT.format(query, need_viz=False, need_dispatch=False, content_preview)
+  ↓
+llm.bind_tools(external_tools).ainvoke([HumanMessage(prompt)])
+  ↓
+response.tool_calls → 列表,每项 {id, name, args}
+  ↓
+for each tool_call:
+    tool = external_tools[name]
+    try: result = await tool.ainvoke(args)
+         text = _extract_text(result)
+         yield {name, args, status=success, result=text[:2000]}
+    except: yield {name, args, status=error, error=str(e)}
+  ↓
+collected_invocations 累加 → SSE 推完后落库
+```
+
+### 6.5 工件持久化与会话回放
+
+```
+首次访问会话                          切走再切回
+─────────────────                    ───────────────────
+SSE stream                            GET /sessions/{id}/messages
+  ↓                                     ↓
+ChatView 增量累计:                    后端反序列化 row.citations_json /
+  content / citations /                tool_invocations_json
+  mermaid_code /                       传回 MessageItem 列表
+  tool_invocations[]                     ↓
+  ↓                                    ChatView 加载历史:
+后端 Stage 8 UPDATE                    map → UIMessage (含 mermaid_code /
+  conversations.mermaid_code           tool_invocations)
+  conversations.tool_invocations_json    ↓
+                                       ToolInvocationsList +
+                                       MermaidRenderer 自动重渲染
+```
+
+### 6.6 会话标题异步生成
+
+- 触发点:`/chat` 与 `/chat/stream` 在 `_load_history` 返回空 list 时设 `is_first_turn=True`,assistant 消息存盘后调 `schedule_title_generation(session_id, first_query)`。
+- 调用链:`asyncio.create_task → ensure_session_title → _generate_title_text → _clean_title → INSERT/UPDATE sessions`。
+- 失败完全静默,日志一行 warning。前端通过 `GET /sessions` 拉到 `title` 字段后会自动覆盖侧栏。
+
+---
+
+## 七、数据模型
+
+```
+knowledge_chunks                conversations
+─────────────────               ───────────────────────────────────
+id           PK                  id            PK
+source_file  IDX  ──┐            session_id    IDX ─┐
+heading_path        │            role               │
+chunk_index         │            content            │
+original_text       │            citations_json     │
+embedding   Vector(1024) HNSW    mermaid_code        │
+created_at          │            tool_invocations_json│
+                    │            created_at         │
+sessions            │                                │
+──────────────────  │                                │
+session_id   PK ────┘  (松耦合,不建外键)             │
+title       (LLM 自动生成)                            │
+created_at                                            │
+updated_at                                            │
+                                                      ▼
+feedbacks                              (松耦合,不建外键)
+──────────────────────
+id              PK
+conversation_id IDX
+rating          1 | -1
+comment         nullable
+prompt          冗余存,便于 SFT 采样
+response        冗余存
+created_at
+```
+
+设计说明:
+- **不建外键**:写入路径全在应用层控,降低 DDL 演进负担(早期项目策略,接 Alembic 后再加)。
+- **citations_json / tool_invocations_json 用 TEXT 而非 JSONB**:简化迁移,反正后端解析后扔给 Pydantic 校验,查询不依赖内部字段。
+- **conversations 复合索引** `(session_id, created_at DESC)`:覆盖 `_load_history` 与 `list_sessions`,O(log N) 拉取。
+
+---
+
+## 八、API 参考
 
 ### 对话
+
 | 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/chat` | 同步对话，返回 `conversation_id`（用于 feedback） |
-| POST | `/api/chat/stream` | SSE 流式，事件：`citation`/`token`/`mermaid`/`tool_result`/`done`/`error` |
+|---|---|---|
+| `POST` | `/api/chat` | 同步对话,返回 `conversation_id` 用于反馈 |
+| `POST` | `/api/chat/stream` | SSE 流式,事件:`citation` / `token` / `mermaid` / `tool_result` / `done` / `error` |
+
+请求体:
+```json
+{
+  "query": "请总结牛顿第二定律",
+  "session_id": "s-xxx",
+  "need_visualization": false,
+  "need_dispatch": false,
+  "allow_external_tools": true
+}
+```
+
+SSE `tool_result` 事件 data 载荷(每次工具调用一条):
+```json
+{
+  "name": "list_issues",
+  "args": {"owner": "Yi1chEng", "repo": "EduAgent", "state": "open"},
+  "status": "success",
+  "result": "[...]"            
+}
+```
 
 ### 会话管理
+
 | 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/sessions` | 列出所有会话（按最后活动倒序） |
-| GET | `/api/sessions/{id}/messages` | 拉取会话全部历史消息 |
-| DELETE | `/api/sessions/{id}` | 删除会话及关联反馈 |
+|---|---|---|
+| `GET` | `/api/sessions` | 所有会话,按 `updated_at` 倒序 |
+| `GET` | `/api/sessions/{id}/messages` | 单会话全部历史(正序),含 mermaid_code / tool_invocations |
+| `DELETE` | `/api/sessions/{id}` | 删会话 + 关联 feedbacks |
 
 ### 知识库
+
 | 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/knowledge/upload` | 上传 Markdown 文件 |
-| GET | `/api/knowledge/list` | 列出已导入文档 |
-| DELETE | `/api/knowledge/{source_file}` | 删除指定文档全部 chunks |
+|---|---|---|
+| `POST` | `/api/knowledge/upload` | multipart,`.md` 文件;同名覆盖 |
+| `GET` | `/api/knowledge/list` | 文档列表 + chunk 数 |
+| `DELETE` | `/api/knowledge/{doc_name}` | 删除指定文档全部 chunk |
 
 ### 反馈
+
 | 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/feedback` | 对回答打分（rating ±1）+ 评论 |
+|---|---|---|
+| `POST` | `/api/feedback` | `conversation_id` + `rating(±1)` + 可选 `comment` |
+
+### 健康检查
+
+- `GET /` → `{"status": "ok", "service": "EduAgent"}`
+- `GET /health` → `{"status": "healthy"}`
+- 完整 OpenAPI 在 `/docs`(Swagger UI) / `/redoc`。
 
 ---
 
-## 集成第三方 MCP server
+## 九、MCP 工具生态
 
-编辑 `mcp_servers.json`，把示例里 `_disabled_xxx` 改为 `xxx` 即可启用。`env` / `args` 支持 `${VAR}` 占位符，从 `backend/.env` 读取（避免密钥进仓库）；变量缺失时启动会**跳过该 server 并告警**，不影响其他工具。
+### 9.1 内置工具(`mcp_server/`)
+
+#### `generate_mermaid(description, diagram_type="flowchart")`
+
+- 拼极度详尽的 prompt 调 LLM 产出纯 DSL。
+- `_strip_fences` + `_sanitize_labels` 双重兜底,处理常见 LLM 输出脏数据。
+- 失败返回兜底 flowchart,不抛异常,前端永远能渲染。
+
+#### `send_wechat(content, msg_type="markdown")`
+
+- 直接 POST 企业微信 webhook,errcode=0 视为成功。
+
+### 9.2 外部 MCP server
+
+编辑 `mcp_servers.json`,把 `_disabled_xxx` 改为 `xxx` 即可启用。`env` / `args` 支持 `${VAR}` 占位符,从宿主环境变量解析:
 
 ```json
 {
@@ -116,34 +642,162 @@ API 文档：http://localhost:8000/docs
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
       }
-    },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/app/uploads"]
     }
   }
 }
 ```
 
-启用 GitHub MCP：
+**变量缺失时该 server 跳过 + 日志告警**,不影响其他工具与正常对话。
 
-1. 在 `backend/.env` 写入 `GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx`（[生成入口](https://github.com/settings/personal-access-tokens)）
-2. `docker compose restart backend`
-3. 启动日志看到 `MCP 服务器: [..., 'github']` 即接入成功
+启动日志确认接入成功:
+```
+INFO:app.graph.nodes:MCP 服务器: ['eduagent', 'github']; 已加载工具: ['generate_mermaid', 'send_wechat', 'list_issues', 'create_issue', ...]
+```
 
-LLM 会在 `dispatcher` 阶段看到所有工具，按需自动调用(列 issue、查 PR、读文件、提交等)。
+### 9.3 工具调度策略
+
+| 触发方式 | 策略 |
+|---|---|
+| `need_visualization=True` 或问题命中可视化关键词 | dispatcher **绕过 LLM 决策直接调** `generate_mermaid`,完整内容传入 |
+| `need_dispatch=True` | dispatcher **绕过 LLM 决策直接调** `send_wechat`,截前 1500 字 |
+| `allow_external_tools=True` 且有外部 MCP server | LLM `bind_tools` **自主决策**(仅暴露非内置工具) |
+| 都为 False | dispatcher 直接 end |
 
 ---
 
-## 技术栈
+## 十、配置与环境变量
 
-- Python 3.11 / FastAPI / SQLAlchemy 2.0 async
-- PostgreSQL 16 + pgvector
-- LangGraph + langchain-openai + langchain-mcp-adapters
-- MCP (FastMCP) / Node.js 22（用于 npx 启动外部 MCP）
+`backend/.env`(从 `.env.example` 复制后填):
+
+```dotenv
+# LLM
+LLM_API_KEY=ms-xxxx
+LLM_BASE_URL=https://api-inference.modelscope.cn/v1
+LLM_MODEL_NAME=Qwen/Qwen3-30B-A3B-Instruct-2507
+
+# Embedding (1024 维须与 db_models.Vector(1024) 对齐)
+EMBEDDING_API_KEY=sk-xxxx
+EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+EMBEDDING_MODEL_NAME=BAAI/bge-m3
+
+# Reranker (可选)
+RERANKER_API_KEY=
+RERANKER_BASE_URL=https://api.siliconflow.cn/v1/rerank
+RERANKER_MODEL_NAME=BAAI/bge-reranker-v2-m3
+
+# DB (docker-compose 会覆盖为容器内地址)
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/eduagent
+
+# 工具
+WECHAT_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
+GITHUB_PERSONAL_ACCESS_TOKEN=
+```
+
+可调参数:
+- `RAG_OVERFETCH_MULTIPLIER`(默认 4):向量层 over-fetch 倍数。
+- `RAG_RRF_K`(默认 60):RRF 融合常数,值越大越偏向均匀融合。
 
 ---
 
-## License
+## 十一、快速启动
+
+### Docker Compose(推荐)
+
+```bash
+cp backend/.env.example backend/.env
+# 编辑 backend/.env,至少填 LLM_API_KEY 和 EMBEDDING_API_KEY
+
+docker compose up -d --build
+docker compose logs -f backend
+```
+
+启动日志关注:
+- `pgvector 扩展已启用` / `数据库表已创建` / `conversations 表列补齐`
+- `MCP 服务器: ['eduagent', ...]; 已加载工具: [...]`
+- `Application startup complete.`
+
+### 本地开发(后端)
+
+```bash
+cd backend
+python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+# 确保本地有 PostgreSQL 16+ + pgvector 扩展
+uvicorn app.main:app --reload --port 8000
+```
+
+### 本地开发(前端)
+
+```bash
+cd frontend
+npm install
+npm run dev    # 默认 http://localhost:5173,自动代理 /api → :8000
+```
+
+### 上传知识库 + 对话
+
+```bash
+curl -X POST http://localhost:8000/api/knowledge/upload -F "file=@第一章.md"
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query":"请总结第一章","session_id":"s1"}'
+```
+
+API 文档:http://localhost:8000/docs
+
+---
+
+## 十二、前端(简略)
+
+技术栈:**React 18 + Vite 5 + TypeScript 5.6 + Tailwind 3.4 + react-markdown + mermaid 11**。
+
+| 文件 | 职责 |
+|---|---|
+| `src/App.tsx` | 顶层布局,Sidebar + ChatView/KnowledgePanel 切换,生成会话 id |
+| `src/components/ChatView.tsx` | SSE 解析,流式渲染,工具调用卡片,反馈按钮,工具开关栏 |
+| `src/components/Sidebar.tsx` | 会话列表,新建 / 选择 / 删除 |
+| `src/components/MermaidRenderer.tsx` | 按需 init mermaid,渲染 DSL |
+| `src/components/KnowledgePanel.tsx` | 知识库上传 / 列表 / 删除 |
+| `src/lib/api.ts` | REST + 自实现 SSE 解析(`fetch` + `ReadableStream`,POST 走不了原生 EventSource) |
+| `src/lib/types.ts` | Citation / MessageItem / ToolInvocation / UIMessage / StreamEventName 等共享类型 |
+
+SSE 解析关键点(`api.ts::streamChat`):
+- 用 `fetch` + `ReadableStream` + `TextDecoder` 自实现 SSE,因为浏览器 `EventSource` 不支持 POST。
+- 按 `\r?\n\r?\n` 分 event,`event:` / `data:` 行分别解析,兼容 `sse-starlette` 默认 CRLF。
+
+工具调用卡片(`ChatView::ToolInvocationCard`):
+- 折叠 `<details>`,头部展示工具名 + args 单行预览 + 状态图标(✓/✗)。
+- 展开后两块 `<pre>`:参数完整 JSON、返回摘要 or 错误堆栈。
+
+---
+
+## 十三、运维与排障
+
+| 现象 | 排查 |
+|---|---|
+| 启动日志 `跳过 MCP server 'github'：环境变量未设置或为空` | 在 `backend/.env` 加 `GITHUB_PERSONAL_ACCESS_TOKEN=xxx` 后重启 |
+| `MCP 工具预热失败` | Node.js 缺失 / npx 网络不通 / npm 镜像源问题。Dockerfile 默认设了 `npmmirror`,自建镜像后请保留 |
+| `pgvector 扩展已启用` 失败 | 用 `pgvector/pgvector:pg16` 镜像而非纯 Postgres |
+| 流式接口 token 卡顿 | 检查 LLM 端点是否支持 stream;Qwen3 ModelScope 端点已验证支持 |
+| `首请求很慢` | lifespan 预热失败导致冷启动,看启动日志确认 `MCP 工具已预热,共 N 个` |
+| 切回旧会话看不到 mermaid / 工具卡片 | 该会话的消息是新字段加进 DB 之前写的,后续新消息会有 |
+| 同名 `.md` 重传 chunk 翻倍 | 不会;upload 端点会先 DELETE 同名再插入 |
+| 容器内挂载源码却不重载 | uvicorn `--reload` 监听 `/app`,docker-compose 把 `./backend` 挂为 `/app`;Windows 上文件改动可能延迟,WSL2 下正常 |
+
+---
+
+## 十四、路线图
+
+- [ ] **接入 Alembic** 替换 `ADD COLUMN IF NOT EXISTS` 兜底
+- [ ] **API 鉴权 + 限流**:目前 `/api/*` 全裸,生产前必接
+- [ ] **`/chat` 非流式契约对齐**:`tool_results` 改为 `tool_invocations` 数组形态
+- [ ] **`_get_mcp_tools` 加锁**:消除冷启动并发 fork 子进程的竞争
+- [ ] **TOOL_AGENT_SYSTEM_PROMPT 按路径分流**:外部 MCP 自主路径走专门 prompt,减少 mermaid / wechat 噪音
+- [ ] **测试套件**:`pytest` + 关键路径覆盖(混合检索 / 占位符展开 / SSE 解析)
+- [ ] **可选切换** `ghcr.io/github/github-mcp-server`(GitHub 官方 Go 实现,功能更全)
+
+---
+
+## 十五、License
 
 MIT
