@@ -29,6 +29,8 @@ export interface MessageItem {
   role: "user" | "assistant";
   content: string;
   citations: Citation[];
+  mermaid_code?: string | null;
+  tool_invocations?: ToolInvocation[];
   created_at: string;
 }
 

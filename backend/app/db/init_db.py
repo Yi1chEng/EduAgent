@@ -22,6 +22,15 @@ async def init_database() -> None:
         await conn.run_sync(Base.metadata.create_all)
         logger.info("数据库表已创建")
 
+        # 轻量"迁移"：增量列补齐（暂未接入 Alembic，用 IF NOT EXISTS 幂等加列）
+        # 见 backend/app/models/db_models.py::Conversation
+        await conn.execute(text(
+            "ALTER TABLE conversations "
+            "ADD COLUMN IF NOT EXISTS mermaid_code TEXT, "
+            "ADD COLUMN IF NOT EXISTS tool_invocations_json TEXT"
+        ))
+        logger.info("conversations 表列补齐 (mermaid_code, tool_invocations_json)")
+
         # HNSW 向量索引：cosine 距离，O(log N) 检索，替代原全表扫描
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_knowledge_chunks_embedding_hnsw "

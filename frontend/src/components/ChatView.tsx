@@ -50,6 +50,8 @@ export function ChatView({ sessionId, onConversationUpdate }: Props) {
             role: m.role,
             content: m.content,
             citations: m.citations,
+            mermaid_code: m.mermaid_code ?? undefined,
+            tool_invocations: m.tool_invocations ?? undefined,
           }))
         );
       } catch {

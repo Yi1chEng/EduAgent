@@ -50,6 +50,10 @@ class MessageItem(BaseModel):
     role: str
     content: str
     citations: list[dict[str, Any]] = Field(default_factory=list)
+    mermaid_code: Optional[str] = Field(default=None, description="Mermaid DSL 代码")
+    tool_invocations: list[dict[str, Any]] = Field(
+        default_factory=list, description="工具调用记录列表"
+    )
     created_at: str
 
 

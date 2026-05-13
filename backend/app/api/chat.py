@@ -104,6 +104,8 @@ async def _save_conversation(
     role: str,
     content: str,
     citations_json: str | None = None,
+    mermaid_code: str | None = None,
+    tool_invocations_json: str | None = None,
 ) -> Conversation:
     """保存对话记录到数据库。"""
     conv = Conversation(
@@ -111,6 +113,8 @@ async def _save_conversation(
         role=role,
         content=content,
         citations_json=citations_json,
+        mermaid_code=mermaid_code,
+        tool_invocations_json=tool_invocations_json,
     )
     db.add(conv)
     await db.flush()
@@ -176,12 +180,25 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)) -> Chat
         mermaid_code = result.get("mermaid_code") or None
         tool_results = result.get("tool_results") or None
 
+        # 老 dispatcher_node 的 tool_results 是 {name: {status, result}}，
+        # 转换为统一的 tool_invocations 列表存盘（args 在该路径下缺失，留空 dict）
+        tool_invocations_json = (
+            json.dumps(
+                _legacy_tool_results_to_invocations(tool_results),
+                ensure_ascii=False,
+            )
+            if tool_results
+            else None
+        )
+
         assistant_conv = await _save_conversation(
             db,
             request.session_id,
             "assistant",
             content,
             json.dumps(citations, ensure_ascii=False) if citations else None,
+            mermaid_code=mermaid_code,
+            tool_invocations_json=tool_invocations_json,
         )
 
         if is_first_turn:
@@ -302,19 +319,22 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                     schedule_title_generation(request.session_id, request.query)
 
                 # ===== Stage 5: 等并行的 mermaid 任务结束，单独推 mermaid 事件 =====
+                final_mermaid_code: str = ""
                 if mermaid_task is not None:
                     try:
-                        mermaid_code = await mermaid_task
-                        if mermaid_code:
-                            yield {"event": "mermaid", "data": mermaid_code}
+                        final_mermaid_code = (await mermaid_task) or ""
+                        if final_mermaid_code:
+                            yield {"event": "mermaid", "data": final_mermaid_code}
                     except Exception as e:
                         logger.error(f"并行 mermaid 失败: {e}")
 
                 # ===== Stage 6: 工具调用（互斥：显式微信推送 vs LLM 自主调用外部 MCP） =====
+                collected_invocations: list[dict[str, Any]] = []
                 if request.need_dispatch:
                     async for invocation in _stream_wechat_dispatch(
                         request.query, final_content
                     ):
+                        collected_invocations.append(invocation)
                         yield {
                             "event": "tool_result",
                             "data": json.dumps(invocation, ensure_ascii=False),
@@ -323,10 +343,22 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                     async for invocation in _stream_autonomous_tools(
                         request.query, final_content
                     ):
+                        collected_invocations.append(invocation)
                         yield {
                             "event": "tool_result",
                             "data": json.dumps(invocation, ensure_ascii=False),
                         }
+
+                # ===== Stage 7: 工件落盘（mermaid / 工具调用），刷新历史可重放 =====
+                # 仅当有内容才写 UPDATE，避免无谓 IO
+                if final_mermaid_code or collected_invocations:
+                    assistant_conv.mermaid_code = final_mermaid_code or None
+                    assistant_conv.tool_invocations_json = (
+                        json.dumps(collected_invocations, ensure_ascii=False)
+                        if collected_invocations
+                        else None
+                    )
+                    await db.commit()
 
             except Exception as e:
                 logger.error(f"流式对话失败: {e}", exc_info=True)
@@ -334,6 +366,27 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                 yield {"event": "error", "data": str(e)}
 
     return EventSourceResponse(event_generator())
+
+
+def _legacy_tool_results_to_invocations(
+    tool_results: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """把老 dispatcher_node 的 {name: {status, result|message}} 转成统一 invocations 列表。
+
+    args 字段在该路径下缺失，留空 dict；用于把同步 /chat 也补齐持久化形态。
+    """
+    invocations: list[dict[str, Any]] = []
+    for name, payload in tool_results.items():
+        if not isinstance(payload, dict):
+            continue
+        status = payload.get("status", "success")
+        item: dict[str, Any] = {"name": name, "args": {}, "status": status}
+        if status == "error":
+            item["error"] = payload.get("message") or payload.get("error", "")
+        else:
+            item["result"] = payload.get("result", "")
+        invocations.append(item)
+    return invocations
 
 
 # SSE tool_result 事件载荷上限：避免大返回阻塞流 / 撑爆前端
@@ -532,12 +585,22 @@ async def get_session_messages(
             cites = json.loads(row.citations_json) if row.citations_json else []
         except json.JSONDecodeError:
             cites = []
+        try:
+            invocations = (
+                json.loads(row.tool_invocations_json)
+                if row.tool_invocations_json
+                else []
+            )
+        except json.JSONDecodeError:
+            invocations = []
         messages.append(
             MessageItem(
                 id=row.id,
                 role=row.role,
                 content=row.content,
                 citations=cites,
+                mermaid_code=row.mermaid_code,
+                tool_invocations=invocations,
                 created_at=row.created_at.isoformat(),
             )
         )

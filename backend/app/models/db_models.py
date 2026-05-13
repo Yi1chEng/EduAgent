@@ -63,6 +63,14 @@ class Conversation(Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False, comment="角色：user 或 assistant")
     content: Mapped[str] = mapped_column(Text, nullable=False, comment="消息内容")
     citations_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="引用来源JSON")
+    mermaid_code: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, comment="本条回答附带的 Mermaid DSL（仅 assistant 消息可能有）"
+    )
+    tool_invocations_json: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="本条回答触发的工具调用列表 JSON：[{name, args, status, result?, error?}]",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), comment="创建时间"
     )
