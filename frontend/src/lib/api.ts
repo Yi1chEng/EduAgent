@@ -26,6 +26,7 @@ export interface ChatPayload {
   session_id: string;
   need_visualization?: boolean;
   need_dispatch?: boolean;
+  allow_external_tools?: boolean;
 }
 
 export async function postChat(payload: ChatPayload): Promise<ChatResponse> {

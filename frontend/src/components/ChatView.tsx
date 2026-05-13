@@ -5,6 +5,7 @@ import {
   Send,
   ImageIcon,
   Bell,
+  Plug,
   ThumbsUp,
   ThumbsDown,
   Sparkles,
@@ -32,6 +33,7 @@ export function ChatView({ sessionId, onConversationUpdate }: Props) {
   const [input, setInput] = useState("");
   const [needViz, setNeedViz] = useState(false);
   const [needDispatch, setNeedDispatch] = useState(false);
+  const [allowExternalTools, setAllowExternalTools] = useState(true);
   const [streaming, setStreaming] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -91,6 +93,7 @@ export function ChatView({ sessionId, onConversationUpdate }: Props) {
           session_id: sessionId,
           need_visualization: needViz,
           need_dispatch: needDispatch,
+          allow_external_tools: allowExternalTools,
         },
         (event, data) => {
           setMessages((prev) => {
@@ -180,7 +183,7 @@ export function ChatView({ sessionId, onConversationUpdate }: Props) {
 
       <div className="px-6 pb-6 pt-3 bg-gradient-to-t from-cream-100 via-cream-100 to-transparent">
         <div className="max-w-3xl mx-auto">
-          <div className="flex items-center gap-2 mb-2 text-xs">
+          <div className="flex items-center gap-2 mb-2 text-xs flex-wrap">
             <Toggle
               icon={<ImageIcon className="w-3.5 h-3.5" />}
               label="生成图表"
@@ -192,6 +195,12 @@ export function ChatView({ sessionId, onConversationUpdate }: Props) {
               label="推送企业微信"
               active={needDispatch}
               onChange={setNeedDispatch}
+            />
+            <Toggle
+              icon={<Plug className="w-3.5 h-3.5" />}
+              label="允许外部工具"
+              active={allowExternalTools}
+              onChange={setAllowExternalTools}
             />
           </div>
           <div className="card flex items-end gap-2 p-2">

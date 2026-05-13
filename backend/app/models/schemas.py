@@ -13,6 +13,10 @@ class ChatRequest(BaseModel):
     session_id: str = Field(..., description="会话ID，用于关联上下文")
     need_visualization: bool = Field(default=False, description="是否需要生成图表")
     need_dispatch: bool = Field(default=False, description="是否需要推送消息")
+    allow_external_tools: bool = Field(
+        default=True,
+        description="是否允许 LLM 自主调用外部 MCP 工具（如 github），关闭则只回正文",
+    )
 
 
 class ChatResponse(BaseModel):

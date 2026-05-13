@@ -319,7 +319,7 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                             "event": "tool_result",
                             "data": json.dumps(invocation, ensure_ascii=False),
                         }
-                elif _has_external_mcp_servers():
+                elif request.allow_external_tools and _has_external_mcp_servers():
                     async for invocation in _stream_autonomous_tools(
                         request.query, final_content
                     ):
