@@ -108,20 +108,38 @@ async def _generate_answer(
     return content or ""
 
 
+async def _with_retry(coro_factory, attempts: int = 3, base_delay: float = 2.0):
+    """对 LLM/judge 调用做指数退避重试,缓解 API 间歇性 Connection error / 限流。"""
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            return await coro_factory()
+        except Exception as e:
+            last_exc = e
+            delay = base_delay * (2 ** i)
+            logger.warning(f"调用失败({type(e).__name__}: {e}),{delay}s 后重试 ({i+1}/{attempts})")
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 async def _run_one(
     ablation: AnswerAblation,
     llm: ChatOpenAI,
     judge: ChatOpenAI,
     query: str,
     top_k: int,
+    inter_call_delay_sec: float = 0.0,
 ) -> dict[str, Any]:
     if ablation.use_rag:
         docs = await retrieve(query, top_k=top_k)
     else:
         docs = []
-    answer = await _generate_answer(llm, query, docs, ablation.use_rag)
+    answer = await _with_retry(lambda: _generate_answer(llm, query, docs, ablation.use_rag))
+    if inter_call_delay_sec:
+        await asyncio.sleep(inter_call_delay_sec)
     retrieved_texts = [d["text"] for d in docs] if docs else []
-    scores = await evaluate_sample(judge, query, answer, retrieved_texts)
+    scores = await _with_retry(lambda: evaluate_sample(judge, query, answer, retrieved_texts))
     return {
         "ablation": ablation.name,
         "answer": answer,
@@ -151,9 +169,12 @@ async def main_async(args: argparse.Namespace) -> None:
             continue
 
         logger.info(f"== ablation {ablation.name}: {ablation.description}")
-        for item in items:
+        for idx, item in enumerate(items):
             try:
-                row = await _run_one(ablation, llm, judge, item.query, args.top_k)
+                row = await _run_one(
+                    ablation, llm, judge, item.query, args.top_k,
+                    inter_call_delay_sec=args.inter_call_delay,
+                )
                 row.update({
                     "query_id": item.id,
                     "query": item.query,
@@ -161,9 +182,10 @@ async def main_async(args: argparse.Namespace) -> None:
                     "difficulty": item.difficulty,
                 })
             except Exception as e:
-                logger.error(f"{ablation.name}/{item.id} 失败: {e}", exc_info=True)
+                logger.error(f"{ablation.name}/{item.id} 失败: {e}")
                 continue
             per_sample_rows.append(row)
+            logger.info(f"  [{idx+1}/{len(items)}] {item.id} → AR={row['answer_relevance']:.2f} F={row['faithfulness']:.2f} CR={row['context_relevance']:.2f}")
 
     # 写 per-sample
     per_sample_path = output_dir / "per_sample.jsonl"
@@ -218,6 +240,10 @@ def main() -> None:
     parser.add_argument("--benchmark", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--inter-call-delay", type=float, default=0.0,
+        help="生成与判定之间的固定 sleep 秒数,缓解 API 限流(默认 0)",
+    )
     args = parser.parse_args()
     asyncio.run(main_async(args))
 

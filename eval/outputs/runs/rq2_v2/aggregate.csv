@@ -1,0 +1,4 @@
+ablation,n,faithfulness,answer_relevance,context_relevance
+A0_plain_llm,10,0.1,0.99,0.0
+A1_rag_only,10,0.3648214285714285,0.6900000000000001,0.02
+A2_eduagent_full,10,0.4013888888888889,0.55,0.02

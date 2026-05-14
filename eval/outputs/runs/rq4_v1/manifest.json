@@ -1,0 +1,13 @@
+{
+  "task": "RQ4_performance",
+  "timestamp_utc": "2026-05-14T03:33:50.917362+00:00",
+  "base_url": "http://localhost:8000",
+  "benchmark": "/app/eval/benchmarks/qa_v1.jsonl",
+  "concurrencies": [
+    1,
+    3,
+    5
+  ],
+  "repeats_per_query": 2,
+  "n_queries": 10
+}

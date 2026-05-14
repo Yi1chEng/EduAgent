@@ -1,0 +1,16 @@
+\begin{table}[t]
+\centering
+\caption{RQ1: 混合检索 ablation 结果}
+\label{tab:rq1}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+ablation & n\_samples & recall@1 & recall@3 & recall@5 & recall@10 & hit@5 & mrr & ndcg@10 \\
+\midrule
+R1\_vector\_only & 9.0000 & 0.0033 & 0.0033 & 0.0033 & 0.0033 & 0.1111 & 0.1111 & 0.0245 \\
+R2\_vector\_overfetch & 9.0000 & 0.0033 & 0.0033 & 0.0033 & 0.0033 & 0.1111 & 0.1111 & 0.0245 \\
+R3\_plus\_keyword & 9.0000 & 0.0139 & 0.0139 & 0.0139 & 0.0139 & 0.1111 & 0.1111 & 0.0281 \\
+R4\_plus\_rrf & 9.0000 & 0.0172 & 0.0172 & 0.0172 & 0.0172 & 0.2222 & 0.2222 & 0.0526 \\
+R5\_full & 9.0000 & 0.0172 & 0.0172 & 0.0172 & 0.0172 & 0.2222 & 0.2222 & 0.0526 \\
+\bottomrule
+\end{tabular}
+\end{table}

@@ -198,7 +198,19 @@ docker compose exec backend bash -c "cd /app && python -m eval.runners.run_retri
 
 ---
 
-## 八、扩展点
+## 八、首轮已跑数据
+
+`outputs/runs/RESULTS.md` 汇总了 RQ1 + RQ2 + RQ4 三组的 smoke-grade 真实结果(N=10,judge=DeepSeek):
+
+- **RQ1**:R4/R5 完整混合检索 Hit@5 是 R1 向量-only 的 **2×**
+- **RQ2**:**Faithfulness 0.10 → 0.36 → 0.40**(plain → RAG → EduAgent),RAG 的教学忠实度收益清晰
+- **RQ4**:并发=1 时 TTFT p99 < 1.7s,并发≥3 后失败率来自上游 LLM 限流(非系统瓶颈)
+
+每个 run 都附 manifest.json(SHA / 时间 / 模型),论文可复现。
+
+---
+
+## 九、扩展点
 
 - 增加 ablation:编辑 `configs/ablations.py`,加新条目即可,不用改 runner
 - 替换 judge 实现:`metrics/ragas_eval.py` 三个函数都是独立的,改 prompt 或换模型互不影响

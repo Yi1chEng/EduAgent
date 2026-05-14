@@ -1,0 +1,14 @@
+\begin{table}[t]
+\centering
+\caption{RQ4: 流式接口性能(并发与延迟)}
+\label{tab:rq4}
+\begin{tabular}{lrrrrrrrrrrr}
+\toprule
+concurrency & n\_requests & n\_success & n\_error & wall\_time\_sec & qps & ttft\_p50\_ms & ttft\_p95\_ms & ttft\_p99\_ms & e2e\_p50\_ms & e2e\_p95\_ms & e2e\_p99\_ms \\
+\midrule
+1 & 20 & 20 & 0 & 92.1600 & 0.2200 & 594.8000 & 1074.0000 & 1602.3000 & 4289.1000 & 6759.6000 & 7636.1000 \\
+3 & 20 & 12 & 8 & 28.1600 & 0.4300 & 1056.6000 & 2415.4000 & 2415.4000 & 5434.6000 & 6454.0000 & 6454.0000 \\
+5 & 20 & 12 & 8 & 20.9800 & 0.5700 & 1399.1000 & 2347.0000 & 2347.0000 & 6222.0000 & 9524.6000 & 9524.6000 \\
+\bottomrule
+\end{tabular}
+\end{table}

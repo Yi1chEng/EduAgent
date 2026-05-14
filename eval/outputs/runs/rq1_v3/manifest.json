@@ -1,0 +1,15 @@
+{
+  "task": "RQ1_retrieval",
+  "timestamp_utc": "2026-05-14T00:59:30.572172+00:00",
+  "benchmark": "/app/eval/benchmarks/qa_v1.jsonl",
+  "benchmark_sha256_16": "82423bfb052e5c67",
+  "top_k": 10,
+  "ablations": [
+    "R1_vector_only",
+    "R2_vector_overfetch",
+    "R3_plus_keyword",
+    "R4_plus_rrf",
+    "R5_full"
+  ],
+  "n_items": 10
+}

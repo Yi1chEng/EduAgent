@@ -1,0 +1,16 @@
+{
+  "task": "RQ2_answer",
+  "timestamp_utc": "2026-05-14T02:02:12.591846+00:00",
+  "benchmark": "/app/eval/benchmarks/qa_v1.jsonl",
+  "benchmark_sha256_16": "82423bfb052e5c67",
+  "top_k": 5,
+  "judge_model": "deepseek-v4-pro",
+  "judge_base_url": "https://api.deepseek.com",
+  "ablations": [
+    "A0_plain_llm",
+    "A1_rag_only",
+    "A2_eduagent_full",
+    "A3_baseline_llm"
+  ],
+  "n_items": 10
+}
