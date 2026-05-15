@@ -8,14 +8,16 @@ from pydantic import BaseModel, Field
 # ========== 对话相关 ==========
 
 class ChatRequest(BaseModel):
-    """对话请求模型。"""
+    """对话请求模型。
+
+    enabled_tools 由前端传入，键为工具 id（与 TOOLS_REGISTRY 对齐），值为是否启用。
+    缺失的键回退到该工具在 registry 中的 default_enabled。
+    """
     query: str = Field(..., description="用户当前问题")
     session_id: str = Field(..., description="会话ID，用于关联上下文")
-    need_visualization: bool = Field(default=False, description="是否需要生成图表")
-    need_dispatch: bool = Field(default=False, description="是否需要推送消息")
-    allow_external_tools: bool = Field(
-        default=True,
-        description="是否允许 LLM 自主调用外部 MCP 工具（如 github），关闭则只回正文",
+    enabled_tools: dict[str, bool] = Field(
+        default_factory=dict,
+        description="本轮对话中启用的工具集合，键 = 工具 id，值 = 是否启用",
     )
 
 
@@ -69,8 +71,26 @@ class SessionDeleteResponse(BaseModel):
 
 class StreamEvent(BaseModel):
     """SSE 流式事件。"""
-    event: str = Field(..., description="事件类型：token / citation / mermaid / done / error")
+    event: str = Field(..., description="事件类型：token / citation / mermaid / tool_result / done / error")
     data: str = Field(..., description="事件数据")
+
+
+# ========== 工具注册表 ==========
+
+class ToolConfig(BaseModel):
+    """单个工具的配置项，用于 GET /api/tools 响应。"""
+    id: str = Field(..., description="工具 id（与 LLM tool name 一致）")
+    display_name: str = Field(..., description="UI 展示名称")
+    description: str = Field(..., description="工具用途说明")
+    category: str = Field(..., description="internal / external")
+    risk_level: str = Field(..., description="LOW / MEDIUM / HIGH")
+    default_enabled: bool = Field(..., description="是否默认启用")
+    mcp_server: str = Field(..., description="提供该工具的 MCP server 名称")
+
+
+class ToolsListResponse(BaseModel):
+    """GET /api/tools 响应。"""
+    tools: list[ToolConfig]
 
 
 # ========== 知识库相关 ==========

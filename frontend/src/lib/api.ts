@@ -4,6 +4,7 @@ import type {
   MessageItem,
   SessionListItem,
   StreamEventName,
+  ToolConfig,
 } from "./types";
 
 const BASE = "/api";
@@ -24,9 +25,16 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
 export interface ChatPayload {
   query: string;
   session_id: string;
-  need_visualization?: boolean;
-  need_dispatch?: boolean;
-  allow_external_tools?: boolean;
+  /** 工具启用集合：键 = 工具 id，值 = 是否启用。缺失键回退到 registry 默认值。 */
+  enabled_tools?: Record<string, boolean>;
+}
+
+// ===== 工具注册表 =====
+
+export async function getToolsConfig(): Promise<ToolConfig[]> {
+  const res = await fetch(`${BASE}/tools`);
+  const data = await jsonOrThrow<{ tools: ToolConfig[] }>(res);
+  return data.tools;
 }
 
 export async function postChat(payload: ChatPayload): Promise<ChatResponse> {

@@ -72,9 +72,14 @@ async def _stream_one(
     payload = {
         "query": query,
         "session_id": f"perf-{uuid.uuid4().hex[:8]}",
-        "need_visualization": False,
-        "need_dispatch": False,
-        "allow_external_tools": False,  # 性能测试时关闭,不引入外部 MCP 噪音
+        # 性能测试关闭所有工具，避免引入外部依赖噪音
+        "enabled_tools": {
+            "generate_mermaid": False,
+            "send_wechat": False,
+            "github": False,
+            "fetch": False,
+            "filesystem": False,
+        },
     }
     try:
         async with client.stream(

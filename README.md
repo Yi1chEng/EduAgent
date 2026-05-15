@@ -88,23 +88,26 @@
                                       └───────────────────────┘
 ```
 
-请求流向(以 `/api/chat/stream` 为例):
+请求流向(以 `/api/chat/stream` 为例,**统一工具注册表**架构):
 
 ```
-client ──POST─► /chat/stream
+client ──POST {query, session_id, enabled_tools}─► /chat/stream
                  │
-                 ├─ Stage 1  并行启动:RAG 检索(可选) + 写 user 消息到 DB
-                 ├─ Stage 2  立即推 SSE event: citation
-                 ├─ Stage 3  并行启动 mermaid 任务(若 need_visualization)
-                 ├─ Stage 4  LLM astream → 逐 token SSE event: token
-                 ├─ Stage 5  保存 assistant 消息 → SSE event: done(含 conversation_id)
-                 ├─ Stage 6  等 mermaid 任务结束 → SSE event: mermaid
-                 ├─ Stage 7  工具调用(互斥):
-                 │            ├─ need_dispatch=True → 调 send_wechat
-                 │            └─ allow_external_tools && 有外部 MCP → LLM 自主决策
-                 │                                    每个工具调用单独推 tool_result event
-                 └─ Stage 8  把 mermaid_code / tool_invocations 二次 commit 到 assistant 行
+                 ├─ Stage 1  并行:RAG 检索(可选) + 写 user 消息到 DB
+                 ├─ Stage 2  推 SSE event: citation
+                 ├─ Stage 3  prompt 注入"本轮启用的工具清单"(含 LOW/MEDIUM/HIGH 风险标签)
+                 ├─ Stage 4  llm.bind_tools(enabled).astream() 第一轮流式
+                 │            ├─ 逐 token 推 SSE event: token
+                 │            └─ AIMessageChunk 累加抓 tool_calls
+                 ├─ Stage 5  顺序执行 tool_calls(每个独立推 tool_result event,
+                 │             status ∈ success / error / rejected)
+                 ├─ Stage 6  若有 tool_call → 带 ToolMessage 回灌再 astream 第二轮 → 继续推 token
+                 ├─ Stage 7  推 SSE event: mermaid(若 generate_mermaid 命中)
+                 └─ Stage 8  落库 → SSE event: done(含 conversation_id)
 ```
+
+**注:** 不再有 dispatcher 节点 / `need_visualization` / `need_dispatch` 等显式开关,
+所有工具(内置 + 外部)统一由 LLM 基于系统提示自主决策。
 
 ---
 
@@ -157,14 +160,17 @@ EduAgent/
 │   │   ├── main.py             # FastAPI 入口、CORS、lifespan 预热
 │   │   ├── config.py           # Pydantic Settings 单例
 │   │   ├── api/
-│   │   │   ├── chat.py         # 对话:同步/流式/会话管理 (~800 行,核心)
+│   │   │   ├── chat.py         # 对话:同步/流式/会话管理/GET /tools
 │   │   │   ├── knowledge.py    # 知识库上传/列表/删除
 │   │   │   └── feedback.py     # 反馈提交
+│   │   ├── tools/
+│   │   │   ├── registry.py     # 统一工具注册表(metadata + 启用集合过滤)
+│   │   │   └── __init__.py
 │   │   ├── graph/
-│   │   │   ├── builder.py      # StateGraph 编译
+│   │   │   ├── builder.py      # StateGraph 编译(线性:rag_retriever → generator → END)
 │   │   │   ├── state.py        # AgentState TypedDict
-│   │   │   ├── nodes.py        # rag_retriever / generator / dispatcher
-│   │   │   ├── edges.py        # 条件路由 (是否走 dispatcher)
+│   │   │   ├── nodes.py        # rag_retriever / generator(内部 bind_tools 自主决策)
+│   │   │   ├── edges.py        # 已废弃占位(线性图不需要条件边)
 │   │   │   └── titles.py       # 会话标题异步生成
 │   │   ├── rag/
 │   │   │   ├── retriever.py    # 混合检索:向量+关键词+RRF+rerank
@@ -242,60 +248,71 @@ EduAgent/
 
 ### 5.6 `app/models/schemas.py`(Pydantic Schema)
 
-- `ChatRequest`:`query` / `session_id` / `need_visualization` / `need_dispatch` / `allow_external_tools`(默认 True)。
-- `ChatResponse`:`conversation_id` / `content` / `citations` / `mermaid_code` / `tool_results`。
+- `ChatRequest`:`query` / `session_id` / `enabled_tools: dict[str, bool]`(本轮要启用的工具,缺失键回退到 registry 默认值)。
+- `ChatResponse`:`conversation_id` / `content` / `citations` / `mermaid_code` / `tool_results`(后者为 `{name: invocation}` 字典)。
+- `ToolConfig` / `ToolsListResponse`:`GET /api/tools` 响应模型,前端 `ToolSelector` 用它渲染开关。
 - `SessionListItem`:`title` / `last_message`(80 字预览) / `last_role` / `message_count` / `updated_at`。
 - `MessageItem`:历史消息,含 `mermaid_code` 与 `tool_invocations`(用于切回会话时重放工件)。
 - `FeedbackRequest`:`conversation_id` / `rating(1|-1)` / `comment`。
 
-### 5.7 `app/graph/state.py`
+### 5.7 `app/tools/registry.py`(**统一工具注册表**)
 
-`AgentState` 是 `TypedDict(total=False)`,LangGraph 节点共享:`messages` / `query` / `retrieved_docs` / `citations` / `generated_content` / `tool_results` / `need_visualization` / `need_dispatch` / `mermaid_code` / `session_id`。
+整个项目唯一的工具元数据中心,删除了内置 / 外部的二分法。
 
-### 5.8 `app/graph/nodes.py`(三大节点)
+- `ToolCategory`:`internal` / `external`(只为前端分组渲染,后端调度不区分)。
+- `RiskLevel`:`LOW`(只读) / `MEDIUM`(只读 + 外部网络) / `HIGH`(改写远端/本地状态)。
+- `ToolMetadata`:`@dataclass(frozen=True)`,字段 `id / display_name / description / category / risk_level / default_enabled / mcp_server`。
+- `TOOLS_REGISTRY`:静态字典,当前收录 `generate_mermaid` / `send_wechat` / `github` / `fetch` / `filesystem` 五个工具,前两个 `default_enabled=True`,其余默认禁用。
+- `get_available_tools(loaded_tools, enabled_tools)`:把"MCP client 实际加载到的工具"与"本次请求启用集合"做交集,返回可 `bind_tools()` 的列表。注册但 MCP server 没起来的工具(如未填 `GITHUB_PAT`)静默跳过。
+- `get_default_enabled_map()`:生成默认启用字典,供前端首次拉取使用。
+
+### 5.8 `app/graph/state.py`
+
+`AgentState` 是 `TypedDict(total=False)`,LangGraph 节点共享:`messages` / `query` / `retrieved_docs` / `citations` / `generated_content` / `tool_invocations` / `mermaid_code` / `enabled_tools` / `session_id`。**不再有 `need_visualization` / `need_dispatch` 字段**。
+
+### 5.9 `app/graph/nodes.py`(两大节点)
 
 - `rag_retriever_node`:调 `retriever.retrieve(query, top_k=5)`,失败时返回空 docs 继续往下(不中断)。
-- `generator_node`:用 `GENERATOR_SYSTEM_PROMPT` 拼系统提示 + 最近 10 条 history + 当前 query,`llm.ainvoke` 一次性返回正文。提示词**硬性禁止**在正文嵌入 mermaid,图由独立工具调用产出。
-- `dispatcher_node`:策略
-  - `need_visualization=True` → 直接调 `generate_mermaid`,**绕过 LLM 决策**,把完整 query+正文当 description 传入(防止 LLM 自己提炼缩水)。
-  - `need_dispatch=True` → 直接调 `send_wechat`。
-  - 都为 False 且有外部 MCP → LLM `bind_tools` 自主决定。
+- `generator_node`:
+  - 用 `build_system_prompt(retrieved_docs, enabled_tools)` 拼系统提示,提示词会把本轮启用的工具按 `display_name / 风险等级 / 描述` 全部列出来,并明确告诉 LLM "高风险工具必须有用户明确意图才能调用"。
+  - 通过 `get_available_tools()` 过滤出本轮可用工具,`llm.bind_tools(available)` 一次性 ainvoke。
+  - 若 LLM 输出 `tool_calls`,顺序执行每一个,把 `ToolMessage` 回灌后再跑一次 `_get_llm().ainvoke(...)` 拿到最终正文。
+  - 状态产出:`generated_content` / `tool_invocations` / `mermaid_code`(若 `generate_mermaid` 命中则单独提取)。
 - 同模块还有:
-  - `_get_llm()`(延迟初始化的 `ChatOpenAI` 单例)。
+  - `_get_llm()`:延迟初始化的 `ChatOpenAI` 单例。
   - `_get_mcp_tools()`:聚合内置 `eduagent` MCP + 外部 MCP 的工具,缓存为 `{name: tool}`。
-  - `_load_external_mcp_servers()`:从 `mcp_servers.json` 读外部 server 配置,过滤 `_` 前缀,**展开 `${VAR}` 占位符**;变量缺失时跳过该 server 并打印警告,避免子进程启动后才报错。
+  - `_load_external_mcp_servers()`:从 `mcp_servers.json` 读外部 server 配置,过滤 `_` 前缀,**展开 `${VAR}` 占位符**;变量缺失时跳过该 server 并打印警告。
   - `_extract_text(result)`:把 MCP 返回的 `list[TextContent]` / dict / str 统一拍平为纯字符串。
-  - `_infer_diagram_type(query)`:简易关键词匹配 `mindmap` / `timeline` / `classDiagram` / `sequenceDiagram` / `flowchart`(默认)。
+  - `_content_to_text(content)`:把 LangChain AIMessage `content`(可能是 list[dict])拍平成 str。
 
-### 5.9 `app/graph/edges.py`
+### 5.10 `app/graph/edges.py`(已废弃)
 
-- `_has_external_mcp_servers()`(`lru_cache`):扫一遍 `mcp_servers.json`,只要有非 `_` 前缀的 key 就返回 True。
-- `route_after_generation`:`need_viz` / `need_dispatch` / 有外部 MCP 任一为真 → `dispatcher`,否则 `end`。
+- 线性图(`rag_retriever → generator → END`)不需要任何条件路由,本文件保留为空占位,避免历史 import 路径报错。
 
-### 5.10 `app/graph/builder.py`
+### 5.11 `app/graph/builder.py`
 
-- 装配 `StateGraph(AgentState)`,加节点、加边、`set_entry_point("rag_retriever")`、添加从 `generator` 出发的条件边。
+- 装配 `StateGraph(AgentState)`,只注册 `rag_retriever` 与 `generator` 两个节点,边: `rag_retriever → generator → END`,**没有条件边**。
 - 模块加载时即 `app_graph = build_graph()`,API 层 `await app_graph.ainvoke(state)` 启动。
 
-### 5.11 `app/graph/titles.py`(会话标题)
+### 5.12 `app/graph/titles.py`(会话标题)
 
 - `_TITLE_SYSTEM_PROMPT`:让 LLM 用 ≤12 字概括,直接输出标题。
 - `_clean_title`:去引号 / 标点 / 空白,截到 24 字。
 - `schedule_title_generation(session_id, first_query)`:**fire-and-forget**,`asyncio.create_task`。失败仅记日志,不阻塞主请求。在两个 chat 端点中,**仅当 `is_first_turn=True`** 时调度。
 
-### 5.12 `app/rag/embeddings.py`
+### 5.13 `app/rag/embeddings.py`
 
 - `_get_embeddings_model()` 延迟初始化 `OpenAIEmbeddings`。
 - `embed_text(text)`:**自带 OrderedDict TTL+LRU 缓存**(`maxsize=512`、`ttl=600s`)。同样 query 命中 0 外部 API。
 - `embed_batch(texts, batch_size=32)`:按批调 `aembed_documents`,避免单次过大被 API 拒。
 
-### 5.13 `app/rag/knowledge_loader.py`
+### 5.14 `app/rag/knowledge_loader.py`
 
 - `_split_by_headings`:扫描 `#` / `##`,按一/二级标题切语义段,`heading_path` 写成 `第一章 > 1.2 牛顿定律`。
 - `_secondary_split`:若段落 > 512 字符,按 `\n\n` 二次切分,带 64 字符 overlap;若仍超长则按字符硬切。
 - `load_file(file_path, db)`:read → split → `embed_batch` → `db.add_all`。返回 chunk 数。
 
-### 5.14 `app/rag/retriever.py`(混合检索核心)
+### 5.15 `app/rag/retriever.py`(混合检索核心)
 
 - **章节定向**:`_detect_chapter_filter` 匹配 `第X章`,把 LIKE 条件作为 SQL WHERE 加进去。
 - **向量层(over-fetch)**:`top_k * RAG_OVERFETCH_MULTIPLIER`(默认 4)个候选,`ORDER BY embedding <=> :q_emb`。
@@ -304,57 +321,59 @@ EduAgent/
 - **可选 Reranker**:`RERANKER_API_KEY` 配置后调用 SiliconFlow `bge-reranker-v2-m3`,失败回退 RRF 顺序。
 - 返回 `[{id, text, source_file, heading_path, chunk_index, score}]`。
 
-### 5.15 `app/rag/citation.py`
+### 5.16 `app/rag/citation.py`
 
 - `format_context`:把 docs 拼成 `[1] {text}\n\n[2] {text}` 喂给 LLM。
 - `format_citations`:拼 `[1] {source_file} > {heading_path}` 文本块。
 - `build_citation_list`:产出 API 响应用的结构化字典列表。
 
-### 5.16 `app/api/chat.py`(核心,约 800 行)
+### 5.17 `app/api/chat.py`(核心)
 
 划分为五层:
 
-1. **意图检测**
-   - `_detect_visualization_intent`:命中"流程图 / 脑图 / 思维导图 / mermaid"等关键词 → 自动开 `need_visualization`。
+1. **启发式判定**
    - `_needs_rag`:闲聊 / 元问题 / 极短查询 → 跳过 RAG,零额外 LLM 调用。
+   - 不再有"可视化关键词自动开关"——是否调 `generate_mermaid` 完全由 LLM 看 prompt 决定。
 2. **持久化辅助**
    - `_save_conversation`:写一条 user / assistant 消息,支持 `citations_json` / `mermaid_code` / `tool_invocations_json`。
-   - `_load_history(limit=20)`:倒序拉再反转得正序 history,用于 LLM 上下文。
-3. **同步对话 `POST /chat`**:走完整 LangGraph,把 `mermaid_code` 直接落库,把老格式 `tool_results` 通过 `_legacy_tool_results_to_invocations` 转新数组形态再落库(契约统一)。
-4. **流式对话 `POST /chat/stream`**(`EventSourceResponse`):
+   - `_load_history(limit=20)`:倒序拉再反转得正序 history。
+3. **工具注册表 `GET /tools`**:返回 `TOOLS_REGISTRY` 全部元数据 + 默认启用状态,前端 `ToolSelector` 用它渲染开关。
+4. **同步对话 `POST /chat`**:走完整 LangGraph(`rag_retriever → generator → END`),把 `mermaid_code` / `tool_invocations` 一次性落库。
+5. **流式对话 `POST /chat/stream`**(`EventSourceResponse`):
    - 八阶段流水线(见架构图)。
-   - 用独立 `async with async_session_factory()` 维持 session,**显式 commit 两次**:`done` 前提交正文 + citations、Stage 8 提交 mermaid + tool_invocations。
-   - mermaid 用 **`asyncio.create_task` 与正文流并行**,等正文写完再 `await mermaid_task`,使图表与正文几乎同时到达。
-   - 工具调用走两个 async generator:`_stream_wechat_dispatch` / `_stream_autonomous_tools`,每完成一次调用就 yield 一条 `tool_result` 事件。
-5. **会话管理**
+   - 用独立 `async with async_session_factory()` 维持 session,显式 commit 两次:user 消息进库一次、done 前 assistant 消息 + 工件一起 commit。
+   - 第一轮 `llm.bind_tools(available).astream()`:边流式推 token,边把 `AIMessageChunk` 累加成完整 `AIMessage` 以抓取 `tool_calls`。
+   - 顺序执行每个 tool_call,推 `tool_result` 事件,统一 schema `{name, args, status, result|error}`。
+   - 若有 tool_call → 第二轮 `_get_llm().astream(followup_msgs)`(带 `ToolMessage` 回灌)继续推 token。
+6. **会话管理**
    - `GET /sessions`:单条 SQL 用 `DISTINCT ON` 取每 session 最后一条 + 窗口函数算总数 + `LEFT JOIN sessions` 拼标题,避免 N+1。
    - `GET /sessions/{id}/messages`:正序拉所有消息,反序列化 `citations_json` / `tool_invocations_json`,把 `mermaid_code` 一并塞回响应。
    - `DELETE /sessions/{id}`:先查 conversation_id,然后串联删 `feedbacks` / `conversations` / `sessions`。
 
-### 5.17 `app/api/knowledge.py`
+### 5.18 `app/api/knowledge.py`
 
 - `POST /knowledge/upload`:仅接受 `.md`,先 `DELETE WHERE source_file=?` 再调 `load_file` 实现"覆盖式更新"。
 - `GET /knowledge/list`:按文件名 group by 数 chunk。
 - `DELETE /knowledge/{doc_name}`:数 chunk → delete → 移除磁盘文件。
 
-### 5.18 `app/api/feedback.py`
+### 5.19 `app/api/feedback.py`
 
 - 校验 `rating ∈ {1, -1}`。
 - 校验 `conversation_id` 是 assistant 消息;再回溯找同 session、`created_at <=` 它的最近一条 user 消息当作 prompt。
 - 把 `prompt+response` 一起入 `feedbacks` 表(冗余存,方便日后导出做 SFT 数据)。
 
-### 5.19 `mcp_server/server.py`
+### 5.20 `mcp_server/server.py`
 
 - `FastMCP("eduagent-mcp-tools")`,挨个调 `register_mermaid` / `register_wechat` 注册工具,`stdio` 传输运行。
 
-### 5.20 `mcp_server/tools/mermaid.py`
+### 5.21 `mcp_server/tools/mermaid.py`
 
 - `PROMPT_TEMPLATE` **极度详尽**:硬性语法规则(节点 ID 必须英文、危险字符自动包裹双引号)、丰富度要求(10-20 节点,3 层 mindmap),配 flowchart 与 mindmap 完整示例。
 - `_strip_fences`:剥 ```` ```mermaid ```` 围栏(防 LLM 偷偷加 markdown)。
 - `_sanitize_labels`:正则扫 `[...]` / `((...))` / `{{...}}` / `{...}`,标签内含 `( ) < > ; , & / \ :` 时**自动用双引号包**;LLM 经常忘的语法陷阱被强制兜底。
 - 失败时返回 `flowchart TD\n    A[生成失败: ...]` 兜底图,不抛异常。
 
-### 5.21 `mcp_server/tools/wechat.py`
+### 5.22 `mcp_server/tools/wechat.py`
 
 - 从 `WECHAT_WEBHOOK_URL` 环境变量读 webhook。
 - 支持 `text` / `markdown` 两种消息类型,httpx POST,errcode=0 视为成功。
@@ -375,7 +394,7 @@ sequenceDiagram
     participant LLM as ChatOpenAI
     participant MCP as MCP tools
 
-    C->>API: POST {query, session_id, need_viz?, need_dispatch?, allow_external?}
+    C->>API: POST {query, session_id, enabled_tools}
     par 并行
         API->>RAG: retrieve(query, top_k=5)  [可选]
     and
@@ -383,39 +402,38 @@ sequenceDiagram
     end
     RAG-->>API: top_k docs
     API->>C: event: citation
-    opt need_visualization
-        API->>MCP: generate_mermaid (并行 task)
-    end
-    API->>LLM: astream(messages)
+    Note over API: build_system_prompt(retrieved_docs, enabled_tools)
+    API->>LLM: bind_tools(available).astream() — 第一轮
     loop 每个 token
         LLM-->>API: chunk
         API->>C: event: token
     end
+    Note over API: 累加 AIMessageChunk 抓 tool_calls
+    opt 有 tool_calls
+        loop 每个 tool_call
+            API->>MCP: tool.ainvoke(args)
+            API->>C: event: tool_result {name, args, status, result|error}
+        end
+        API->>LLM: astream(followup_msgs + ToolMessages) — 第二轮
+        loop 每个 token
+            LLM-->>API: chunk
+            API->>C: event: token
+        end
+    end
+    opt generate_mermaid 命中
+        API->>C: event: mermaid
+    end
     API->>DB: insert assistant message + commit
     API->>C: event: done (conversation_id)
     API->>C: schedule_title_generation (fire-and-forget)
-    Note over API: 等 mermaid task
-    API->>C: event: mermaid (若有)
-    alt need_dispatch
-        API->>MCP: send_wechat
-        API->>C: event: tool_result {name, args, status, result}
-    else allow_external_tools && has external MCP
-        API->>LLM: bind_tools().ainvoke()
-        LLM-->>API: tool_calls[]
-        loop 每个 tool_call
-            API->>MCP: tool.ainvoke(args)
-            API->>C: event: tool_result {...}
-        end
-    end
-    API->>DB: UPDATE assistant row set mermaid_code, tool_invocations_json + commit
 ```
 
-**关键性能优化点**:
+**关键设计点**:
 
-- **RAG / user 消息写入并行**:`asyncio.gather` 不让 IO 串行等。
-- **mermaid 与正文 LLM 并行**:用 query + RAG context 直接当 mermaid description,**不等正文写完**就发起调用,图表到达时间几乎等于正文结束。
+- **统一工具决策**:所有工具(内置 + 外部)都通过 `bind_tools(get_available_tools(loaded, enabled))` 暴露给 LLM,由 LLM 看 prompt 自主决策。没有 dispatcher 直通路径,也没有"need_visualization 关键词自动开"启发式。
+- **流式 + tool_calls**:第一轮 astream 同时把 token 推给前端 + 累加 chunk 抓 tool_calls。第二轮在 tool 执行结果回灌后继续流式推 token。前端收到的 token 视觉上是连续的。
 - **token 真实流式**:`llm.astream()` 而非 `ainvoke()`,首字延迟 = TTFT 而非完整 latency。
-- **done 事件早发**:工件还没收齐就发 done + conversation_id,前端立刻能反馈/复制;mermaid / tool_result 异步追加。
+- **风险隔离**:高风险工具(`send_wechat` / `filesystem`)在 prompt 里被显式标注"高风险,仅当用户明确要求时调用",同时前端 `ToolSelector` 用红色徽标提醒用户取消勾选。
 
 ### 6.2 混合检索 `retriever.retrieve()`
 
@@ -465,29 +483,29 @@ load_file:
 返回 {message, source_file, chunks_count}
 ```
 
-### 6.4 LLM 自主调用外部 MCP 工具
+### 6.4 LLM 自主工具调用(统一注册表)
 
 ```
-正文流结束 (done 已发)
+build_system_prompt(retrieved_docs, enabled_tools)
+  └─ 拼入"本轮可用工具清单"(含 LOW/MEDIUM/HIGH 风险标签 + 描述)
+       + 调用原则(高风险须明确意图 / 不要复述结果 / 不要在正文嵌 mermaid 代码块)
   ↓
-chat.py / _stream_autonomous_tools(query, generated_content)
+available = get_available_tools(loaded_mcp_tools, enabled_tools)
+  └─ registry × enabled × loaded 三方交集
   ↓
-filter tools:排除 generate_mermaid / send_wechat(避免与内置直通路径冲突)
+llm.bind_tools(available).astream(messages) — 第一轮
+  ├─ 边推 token 到 SSE,边累加 AIMessageChunk 抓 response.tool_calls
   ↓
-TOOL_AGENT_SYSTEM_PROMPT.format(query, need_viz=False, need_dispatch=False, content_preview)
-  ↓
-llm.bind_tools(external_tools).ainvoke([HumanMessage(prompt)])
-  ↓
-response.tool_calls → 列表,每项 {id, name, args}
-  ↓
-for each tool_call:
-    tool = external_tools[name]
-    try: result = await tool.ainvoke(args)
-         text = _extract_text(result)
-         yield {name, args, status=success, result=text[:2000]}
-    except: yield {name, args, status=error, error=str(e)}
-  ↓
-collected_invocations 累加 → SSE 推完后落库
+若 tool_calls 非空:
+    for each call ∈ tool_calls:
+        if name not in available: yield {status="rejected", error="tool not enabled"}
+        else:
+            try:    result = await tool.ainvoke(args)
+                    yield {status="success", result=text[:2000]}
+            except: yield {status="error", error=str(e)}
+        每个 yield 都对应一条 SSE tool_result 事件
+    _get_llm().astream(followup_msgs + ToolMessages) — 第二轮
+      └─ 把工具结果回灌给 LLM,继续推 token
 ```
 
 ### 6.5 工件持久化与会话回放
@@ -561,6 +579,7 @@ created_at
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| `GET`  | `/api/tools` | 返回全部工具元数据(id / display_name / description / category / risk_level / default_enabled / mcp_server),供前端渲染开关 |
 | `POST` | `/api/chat` | 同步对话,返回 `conversation_id` 用于反馈 |
 | `POST` | `/api/chat/stream` | SSE 流式,事件:`citation` / `token` / `mermaid` / `tool_result` / `done` / `error` |
 
@@ -569,21 +588,29 @@ created_at
 {
   "query": "请总结牛顿第二定律",
   "session_id": "s-xxx",
-  "need_visualization": false,
-  "need_dispatch": false,
-  "allow_external_tools": true
+  "enabled_tools": {
+    "generate_mermaid": true,
+    "send_wechat": false,
+    "github": false,
+    "fetch": false,
+    "filesystem": false
+  }
 }
 ```
+
+`enabled_tools` 中缺失的键回退到 `TOOLS_REGISTRY[id].default_enabled`,所以前端可以只传用户调整过的工具。
 
 SSE `tool_result` 事件 data 载荷(每次工具调用一条):
 ```json
 {
-  "name": "list_issues",
-  "args": {"owner": "Yi1chEng", "repo": "EduAgent", "state": "open"},
+  "name": "generate_mermaid",
+  "args": {"description": "...", "diagram_type": "flowchart"},
   "status": "success",
-  "result": "[...]"            
+  "result": "flowchart TD ..."
 }
 ```
+
+`status` 可能为 `success` / `error` / `rejected`(LLM 调用了一个本轮未启用的工具)。
 
 ### 会话管理
 
@@ -654,14 +681,22 @@ SSE `tool_result` 事件 data 载荷(每次工具调用一条):
 INFO:app.graph.nodes:MCP 服务器: ['eduagent', 'github']; 已加载工具: ['generate_mermaid', 'send_wechat', 'list_issues', 'create_issue', ...]
 ```
 
-### 9.3 工具调度策略
+### 9.3 工具调度策略(统一注册表)
 
-| 触发方式 | 策略 |
-|---|---|
-| `need_visualization=True` 或问题命中可视化关键词 | dispatcher **绕过 LLM 决策直接调** `generate_mermaid`,完整内容传入 |
-| `need_dispatch=True` | dispatcher **绕过 LLM 决策直接调** `send_wechat`,截前 1500 字 |
-| `allow_external_tools=True` 且有外部 MCP server | LLM `bind_tools` **自主决策**(仅暴露非内置工具) |
-| 都为 False | dispatcher 直接 end |
+不再区分"内置直通"和"外部自主"两条路径,所有工具由 LLM 看 system prompt 自主决定调用与否:
+
+| 风险等级 | system prompt 中的描述 | UI 提示 |
+|---|---|---|
+| `LOW`   | "风险:LOW",描述只读 / 无副作用 | 绿色徽标 |
+| `MEDIUM`| "风险:MEDIUM",描述会发外部网络请求但不写状态 | 琥珀徽标 |
+| `HIGH`  | "高风险(会改写远端/本地状态,仅当用户明确要求时调用)" | 红色徽标 + 警告图标 |
+
+工具进入 LLM 决策的条件:
+1. 在 `TOOLS_REGISTRY` 中已注册。
+2. `enabled_tools[id]` 为 `True`(或缺失但 `default_enabled=True`)。
+3. 对应的 MCP server 实际启动成功(外部 server 缺失环境变量则跳过)。
+
+三者都满足才会进入 `bind_tools(...)` 列表。LLM 调用了"未启用"或"未注册"的工具时,后端会以 `status: rejected` 反馈给前端。
 
 ---
 
@@ -754,19 +789,21 @@ API 文档:http://localhost:8000/docs
 | 文件 | 职责 |
 |---|---|
 | `src/App.tsx` | 顶层布局,Sidebar + ChatView/KnowledgePanel 切换,生成会话 id |
-| `src/components/ChatView.tsx` | SSE 解析,流式渲染,工具调用卡片,反馈按钮,工具开关栏 |
+| `src/components/ChatView.tsx` | SSE 解析,流式渲染,工具调用卡片,反馈按钮 |
+| `src/components/ToolSelector.tsx` | 拉 `GET /api/tools` 渲染开关,按 internal/external 分组,LOW/MEDIUM/HIGH 风险徽标 |
 | `src/components/Sidebar.tsx` | 会话列表,新建 / 选择 / 删除 |
 | `src/components/MermaidRenderer.tsx` | 按需 init mermaid,渲染 DSL |
 | `src/components/KnowledgePanel.tsx` | 知识库上传 / 列表 / 删除 |
-| `src/lib/api.ts` | REST + 自实现 SSE 解析(`fetch` + `ReadableStream`,POST 走不了原生 EventSource) |
-| `src/lib/types.ts` | Citation / MessageItem / ToolInvocation / UIMessage / StreamEventName 等共享类型 |
+| `src/lib/api.ts` | REST + 自实现 SSE 解析(`fetch` + `ReadableStream`,POST 走不了原生 EventSource);含 `getToolsConfig()` |
+| `src/lib/types.ts` | Citation / MessageItem / ToolInvocation / UIMessage / ToolConfig / RiskLevel 等共享类型 |
 
 SSE 解析关键点(`api.ts::streamChat`):
 - 用 `fetch` + `ReadableStream` + `TextDecoder` 自实现 SSE,因为浏览器 `EventSource` 不支持 POST。
 - 按 `\r?\n\r?\n` 分 event,`event:` / `data:` 行分别解析,兼容 `sse-starlette` 默认 CRLF。
 
 工具调用卡片(`ChatView::ToolInvocationCard`):
-- 折叠 `<details>`,头部展示工具名 + args 单行预览 + 状态图标(✓/✗)。
+- 折叠 `<details>`,头部展示工具名 + args 单行预览 + 状态图标。
+- 四种状态各自一种样式:`success`(绿勾) / `error`(红 ✗) / `rejected`(琥珀 Ban,工具未启用) / `pending`(灰色旋转)。
 - 展开后两块 `<pre>`:参数完整 JSON、返回摘要 or 错误堆栈。
 
 ---
@@ -775,7 +812,7 @@ SSE 解析关键点(`api.ts::streamChat`):
 
 | 现象 | 排查 |
 |---|---|
-| 启动日志 `跳过 MCP server 'github'：环境变量未设置或为空` | 在 `backend/.env` 加 `GITHUB_PERSONAL_ACCESS_TOKEN=xxx` 后重启 |
+| 启动日志 `跳过 MCP server 'github'：环境变量未设置或为空` | 在 `backend/.env` 加 `GITHUB_PERSONAL_ACCESS_TOKEN=xxx` 后重启,并在前端 `ToolSelector` 中勾上 GitHub 工具 |
 | `MCP 工具预热失败` | Node.js 缺失 / npx 网络不通 / npm 镜像源问题。Dockerfile 默认设了 `npmmirror`,自建镜像后请保留 |
 | `pgvector 扩展已启用` 失败 | 用 `pgvector/pgvector:pg16` 镜像而非纯 Postgres |
 | 流式接口 token 卡顿 | 检查 LLM 端点是否支持 stream;Qwen3 ModelScope 端点已验证支持 |
@@ -790,10 +827,10 @@ SSE 解析关键点(`api.ts::streamChat`):
 
 - [ ] **接入 Alembic** 替换 `ADD COLUMN IF NOT EXISTS` 兜底
 - [ ] **API 鉴权 + 限流**:目前 `/api/*` 全裸,生产前必接
-- [ ] **`/chat` 非流式契约对齐**:`tool_results` 改为 `tool_invocations` 数组形态
+- [ ] **高风险工具二次确认**:`HIGH` 风险工具被 LLM 调用时,弹出确认框由用户人工 approve 再执行
 - [ ] **`_get_mcp_tools` 加锁**:消除冷启动并发 fork 子进程的竞争
-- [ ] **TOOL_AGENT_SYSTEM_PROMPT 按路径分流**:外部 MCP 自主路径走专门 prompt,减少 mermaid / wechat 噪音
-- [ ] **测试套件**:`pytest` + 关键路径覆盖(混合检索 / 占位符展开 / SSE 解析)
+- [ ] **工具调用统计**:把 `tool_invocations` 聚合到反馈表,跑评估时可观测哪些工具被滥用 / 被忽略
+- [ ] **测试套件**:`pytest` + 关键路径覆盖(混合检索 / registry 过滤 / SSE 双轮流式)
 - [ ] **可选切换** `ghcr.io/github/github-mcp-server`(GitHub 官方 Go 实现,功能更全)
 
 ---
