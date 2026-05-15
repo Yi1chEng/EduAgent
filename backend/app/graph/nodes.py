@@ -1,4 +1,10 @@
-"""LangGraph 图节点：RAG 检索、生成、MCP 工具调用（LLM 驱动）。"""
+"""LangGraph 图节点：RAG 检索 + 生成（含 LLM 自主工具调用）。
+
+设计说明：
+- 不再区分 internal / external 工具，全部由 TOOLS_REGISTRY 统一描述。
+- 不再有独立的 dispatcher_node：generator 节点直接 bind_tools(enabled) 让 LLM 自主决策。
+- chat.py 的流式接口会重用本模块的 prompt + tool 加载逻辑，但自己跑 astream。
+"""
 
 import json
 import logging
@@ -7,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
@@ -15,6 +21,7 @@ from app.config import get_settings
 from app.graph.state import AgentState
 from app.rag.citation import build_citation_list, format_citations, format_context
 from app.rag.retriever import retrieve
+from app.tools.registry import TOOLS_REGISTRY, get_available_tools
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +51,7 @@ _ENV_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _expand_env_placeholders(value: str) -> tuple[str, list[str]]:
-    """展开字符串中的 ${VAR} 占位符。
-
-    返回 (展开后的字符串, 缺失的变量名列表)。变量未设置或为空时记入缺失列表。
-    """
+    """展开字符串中的 ${VAR} 占位符。返回 (展开后字符串, 缺失变量名列表)。"""
     missing: list[str] = []
 
     def _sub(match: re.Match[str]) -> str:
@@ -63,9 +67,7 @@ def _expand_env_placeholders(value: str) -> tuple[str, list[str]]:
 def _load_external_mcp_servers() -> dict[str, dict[str, Any]]:
     """从 mcp_servers.json 读取外部 MCP server 配置。
 
-    - 跳过以 '_' 开头的 key（约定为禁用项）。
-    - 支持 env 和 args 中的 ${VAR} 占位符，从宿主环境变量解析。
-    - 若占位符引用的变量缺失，跳过该 server 并告警（避免子进程启动后才报错）。
+    跳过以 '_' 开头的禁用项；env/args 中的 ${VAR} 缺失时跳过该 server。
     """
     path = Path(EXTERNAL_MCP_CONFIG_PATH)
     if not path.exists():
@@ -123,7 +125,6 @@ async def _get_mcp_tools() -> dict[str, Any]:
     if _mcp_tools is None:
         s = get_settings()
         env = os.environ.copy()
-        # 内置 mcp_server 需要的环境变量（wechat 推送、mermaid LLM 生成）
         env.update({
             "WECHAT_WEBHOOK_URL": s.WECHAT_WEBHOOK_URL,
             "LLM_API_KEY": s.LLM_API_KEY,
@@ -157,43 +158,50 @@ async def _get_mcp_tools() -> dict[str, Any]:
     return _mcp_tools
 
 
-GENERATOR_SYSTEM_PROMPT = """你是 EduAgent，专业的教育AI助手。基于参考资料生成准确、有教育价值的回答。
+def build_system_prompt(
+    retrieved_docs: list[dict[str, Any]],
+    enabled_tools: dict[str, bool] | None,
+) -> str:
+    """统一系统提示词。本轮启用的工具会以列表形式列入提示，告诉 LLM 何时调用。"""
+    enabled_tools = enabled_tools or {}
+    tool_lines: list[str] = []
+    for tool_id, meta in TOOLS_REGISTRY.items():
+        if not enabled_tools.get(tool_id, meta.default_enabled):
+            continue
+        risk_tag = (
+            "高风险（会改写远端/本地状态，仅当用户明确要求时调用）"
+            if meta.risk_level.value == "HIGH"
+            else f"风险:{meta.risk_level.value}"
+        )
+        tool_lines.append(
+            f"- `{meta.id}`（{meta.display_name}，{risk_tag}）：{meta.description}"
+        )
 
-规则：
-1. 必须基于参考资料，使用 [1][2] 等标记引用来源
-2. 资料不足时坦诚说明
-3. 使用 Markdown 格式
-4. 复杂概念用类比或例子解释
-5. **关于图表的硬性规定**：
-   - **绝对不要**说"我无法生成图片/图表"、"由于版权限制"、"请使用 Draw.io / Mermaid"等推脱话术
-   - **绝对不要**在正文中嵌入 mermaid / flowchart / mindmap 代码块
-   - 系统会**自动**通过独立工具调用生成 Mermaid 图表并渲染给用户，你不需要也不应该自己画
-   - 如果用户要求图表，正文专心解释知识内容即可；图表会作为附加产物自动出现在你的回答下方
+    if tool_lines:
+        tools_section = (
+            "本轮可用的工具：\n"
+            + "\n".join(tool_lines)
+            + "\n\n工具调用原则：\n"
+            "1. 仅当任务确实需要时才调用；闲聊或简单回答时不要强行调用工具。\n"
+            "2. 高风险工具必须有用户的明确意图（如 推送一下、保存到文件），不要主动调用。\n"
+            "3. 工具调用结果会自动展示给用户，正文中不必复述。\n"
+            "4. 如需图表/可视化，调用 generate_mermaid，把【用户问题 + 当前回答全文】"
+            "作为 description 传入；正文专注解释知识，不要嵌入 mermaid 代码块。\n"
+        )
+    else:
+        tools_section = "本轮没有可用的工具，请直接基于参考资料回答。\n"
 
-参考资料：
-{context}
-
-引用来源：
-{citations}
-"""
-
-
-TOOL_AGENT_SYSTEM_PROMPT = """你是工具调度助手。基于下方信息决定调用哪些工具。
-
-强约束：
-- 如果 need_visualization=True，**必须**调用 generate_mermaid：
-    * description 参数：**必须把"用户原始问题 + 已生成的回答全文"完整拼接传入**，不要自己提炼缩写，否则图会很简单。
-    * diagram_type：**默认 flowchart**；当问题在询问"知识体系/分类/构成/有哪些"时用 mindmap；流程性强用 flowchart；时间顺序用 timeline；对比用 classDiagram。
-- 如果 need_dispatch=True，**必须**调用 send_wechat，content 用已生成的回答主体（截取前 1500 字符）。
-- 如果两个标志都为 False，根据用户问题语义自行判断；若无需工具，直接回复"无需工具"。
-- 工具调用结果会自动返回给用户，你无需复述。
-
-用户原始问题：{query}
-need_visualization={need_visualization}, need_dispatch={need_dispatch}
-
-已生成的回答（**调用 generate_mermaid 时必须把这段完整文本作为 description 的主体**）：
-{generated_content}
-"""
+    return (
+        "你是 EduAgent，专业的教育 AI 助手。基于参考资料生成准确、有教育价值的回答。\n\n"
+        "输出规则：\n"
+        "1. 必须基于参考资料，使用 [1][2] 等标记引用来源。\n"
+        "2. 资料不足时坦诚说明，不要编造。\n"
+        "3. 使用 Markdown 格式；复杂概念用类比或例子解释。\n"
+        "4. 不要在正文里嵌入 mermaid / flowchart 代码块——需要图表时调用工具。\n\n"
+        f"{tools_section}\n"
+        f"参考资料：\n{format_context(retrieved_docs)}\n\n"
+        f"引用来源：\n{format_citations(retrieved_docs)}\n"
+    )
 
 
 async def rag_retriever_node(state: AgentState) -> dict[str, Any]:
@@ -211,115 +219,97 @@ async def rag_retriever_node(state: AgentState) -> dict[str, Any]:
 
 
 async def generator_node(state: AgentState) -> dict[str, Any]:
-    """内容生成节点：基于 RAG 结果生成回答。"""
+    """生成节点：基于 RAG 结果生成回答；按 enabled_tools 给 LLM 暴露可调工具。
+
+    流程：
+    1. 拼系统提示词（含本轮启用的工具说明）
+    2. LLM 一次性生成；如有 tool_calls，依次执行并把结果回灌给 LLM 再生成最终正文
+    3. 收集 tool_invocations + mermaid_code 落到 state
+    """
     query = state.get("query", "")
     retrieved_docs = state.get("retrieved_docs", [])
     messages = state.get("messages", [])
+    enabled_tools = state.get("enabled_tools", {})
 
-    system_prompt = GENERATOR_SYSTEM_PROMPT.format(
-        context=format_context(retrieved_docs),
-        citations=format_citations(retrieved_docs),
-    )
-    llm_messages = [SystemMessage(content=system_prompt)]
-    llm_messages.extend(messages[-10:])
-    llm_messages.append(HumanMessage(content=query))
+    system_prompt = build_system_prompt(retrieved_docs, enabled_tools)
 
-    response = await _get_llm().ainvoke(llm_messages)
-    return {"generated_content": response.content}
+    loaded_tools = await _get_mcp_tools()
+    available = get_available_tools(loaded_tools, enabled_tools)
+    available_by_name = {t.name: t for t in available}
 
+    llm = _get_llm()
+    if available:
+        llm = llm.bind_tools(available)
 
-def _infer_diagram_type(query: str) -> str:
-    """根据用户问题特征猜测合适的 mermaid 图类型。"""
-    q = query.lower()
-    if any(k in query for k in ["知识体系", "分类", "构成", "有哪些", "组成", "脑图", "思维导图", "mindmap"]):
-        return "mindmap"
-    if any(k in query for k in ["时间", "历史", "演变", "发展史", "timeline"]):
-        return "timeline"
-    if any(k in query for k in ["对比", "区别", "差异", "vs", "比较"]):
-        return "classDiagram"
-    if "时序" in query or "sequence" in q:
-        return "sequenceDiagram"
-    return "flowchart"
+    history_msgs = [
+        SystemMessage(content=system_prompt),
+        *messages[-10:],
+        HumanMessage(content=query),
+    ]
+    response = await llm.ainvoke(history_msgs)
 
+    tool_invocations: list[dict[str, Any]] = []
+    mermaid_code = ""
+    tool_calls = getattr(response, "tool_calls", []) or []
 
-async def dispatcher_node(state: AgentState) -> dict[str, Any]:
-    """MCP 工具调度节点。
-
-    策略：
-    - 显式标志 (need_visualization / need_dispatch) → **直接调工具**，跳过 LLM 决策，
-      保证完整内容传入，且省一次 LLM 调用。
-    - 无显式标志但有外部 MCP server → 让 LLM 通过 tool-calling 自主决定。
-    """
-    tool_results: dict[str, Any] = {}
-    mermaid_code: str = ""
-
-    tools_dict = await _get_mcp_tools()
-    if not tools_dict:
-        return {"tool_results": tool_results, "mermaid_code": mermaid_code}
-
-    need_viz = state.get("need_visualization", False)
-    need_dispatch = state.get("need_dispatch", False)
-    query = state.get("query", "")
-    generated_content = state.get("generated_content", "")
-
-    # ===== 直通路径 1：生成图表 =====
-    if need_viz and "generate_mermaid" in tools_dict:
-        full_desc = (
-            f"用户原始问题：{query}\n\n"
-            f"基于以下完整知识内容生成丰富、详细的图表（覆盖所有关键概念、子步骤、分支与关系）：\n\n"
-            f"{generated_content}"
-        )
-        diagram_type = _infer_diagram_type(query)
-        logger.info(f"直接调用 generate_mermaid (diagram_type={diagram_type}, desc_len={len(full_desc)})")
-        try:
-            result = await tools_dict["generate_mermaid"].ainvoke(
-                {"description": full_desc, "diagram_type": diagram_type}
-            )
-            mermaid_code = _extract_text(result)
-            tool_results["generate_mermaid"] = {"status": "success", "result": mermaid_code}
-        except Exception as e:
-            logger.error(f"generate_mermaid 失败: {e}")
-            tool_results["generate_mermaid"] = {"status": "error", "message": str(e)}
-
-    # ===== 直通路径 2：企业微信推送 =====
-    if need_dispatch and "send_wechat" in tools_dict:
-        content = generated_content[:1500] if generated_content else query
-        logger.info(f"直接调用 send_wechat (content_len={len(content)})")
-        try:
-            result = await tools_dict["send_wechat"].ainvoke({"content": content})
-            tool_results["send_wechat"] = {"status": "success", "result": _extract_text(result)}
-        except Exception as e:
-            logger.error(f"send_wechat 失败: {e}")
-            tool_results["send_wechat"] = {"status": "error", "message": str(e)}
-
-    # ===== LLM 自主路径：仅在无显式标志且有 MCP 工具时 =====
-    if not need_viz and not need_dispatch:
-        prompt = TOOL_AGENT_SYSTEM_PROMPT.format(
-            query=query,
-            need_visualization=False,
-            need_dispatch=False,
-            generated_content=generated_content[:1500],
-        )
-        llm_with_tools = _get_llm().bind_tools(list(tools_dict.values()))
-        response = await llm_with_tools.ainvoke([HumanMessage(content=prompt)])
-        for call in getattr(response, "tool_calls", []) or []:
-            name = call["name"]
-            args = call.get("args", {})
-            if name not in tools_dict:
-                tool_results[name] = {"status": "error", "message": "tool not found"}
+    if tool_calls:
+        followup_msgs = [*history_msgs, response]
+        for call in tool_calls:
+            name = call.get("name", "")
+            args = call.get("args", {}) or {}
+            call_id = call.get("id", "")
+            tool = available_by_name.get(name)
+            if tool is None:
+                tool_invocations.append(
+                    {"name": name, "args": args, "status": "error", "error": "tool not enabled"}
+                )
+                followup_msgs.append(
+                    ToolMessage(content="tool not enabled", tool_call_id=call_id)
+                )
                 continue
             try:
-                result = await tools_dict[name].ainvoke(args)
-                text_result = _extract_text(result)
-                tool_results[name] = {"status": "success", "result": text_result}
+                raw = await tool.ainvoke(args)
+                text_result = _extract_text(raw)
+                tool_invocations.append(
+                    {"name": name, "args": args, "status": "success", "result": text_result}
+                )
                 if name == "generate_mermaid":
                     mermaid_code = text_result
-                logger.info(f"LLM 调用工具 {name} 成功")
+                followup_msgs.append(
+                    ToolMessage(content=text_result, tool_call_id=call_id)
+                )
             except Exception as e:
-                logger.error(f"LLM 调用工具 {name} 失败: {e}")
-                tool_results[name] = {"status": "error", "message": str(e)}
+                logger.error(f"工具 {name} 调用失败: {e}", exc_info=True)
+                tool_invocations.append(
+                    {"name": name, "args": args, "status": "error", "error": str(e)}
+                )
+                followup_msgs.append(
+                    ToolMessage(content=f"error: {e}", tool_call_id=call_id)
+                )
 
-    return {"tool_results": tool_results, "mermaid_code": mermaid_code}
+        # 让 LLM 基于工具结果生成最终正文（不再绑工具，避免无限循环）
+        final = await _get_llm().ainvoke(followup_msgs)
+        content = _content_to_text(final.content)
+    else:
+        content = _content_to_text(response.content)
+
+    return {
+        "generated_content": content,
+        "tool_invocations": tool_invocations,
+        "mermaid_code": mermaid_code,
+    }
+
+
+def _content_to_text(content: Any) -> str:
+    """把 LangChain 消息 content（可能是 list[dict]）拍平成字符串。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return str(content)
 
 
 def _extract_text(result: Any) -> str:

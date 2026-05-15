@@ -44,9 +44,23 @@ export interface KnowledgeListItem {
 export interface ToolInvocation {
   name: string;
   args: Record<string, unknown>;
-  status: "success" | "error";
+  status: "success" | "error" | "pending" | "rejected";
   result?: string;
   error?: string;
+}
+
+// 工具注册表项（GET /api/tools 响应）
+export type ToolCategory = "internal" | "external";
+export type RiskLevel = "LOW" | "MEDIUM" | "HIGH";
+
+export interface ToolConfig {
+  id: string;
+  display_name: string;
+  description: string;
+  category: ToolCategory;
+  risk_level: RiskLevel;
+  default_enabled: boolean;
+  mcp_server: string;
 }
 
 // 前端运行时消息状态（用于流式增量更新）

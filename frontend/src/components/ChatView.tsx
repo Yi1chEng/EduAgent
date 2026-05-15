@@ -3,9 +3,6 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Send,
-  ImageIcon,
-  Bell,
-  Plug,
   ThumbsUp,
   ThumbsDown,
   Sparkles,
@@ -14,8 +11,10 @@ import {
   Wrench,
   CheckCircle2,
   XCircle,
+  Ban,
 } from "lucide-react";
 import { MermaidRenderer } from "./MermaidRenderer";
+import { ToolSelector } from "./ToolSelector";
 import {
   getSessionMessages,
   postFeedback,
@@ -31,9 +30,7 @@ interface Props {
 export function ChatView({ sessionId, onConversationUpdate }: Props) {
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [input, setInput] = useState("");
-  const [needViz, setNeedViz] = useState(false);
-  const [needDispatch, setNeedDispatch] = useState(false);
-  const [allowExternalTools, setAllowExternalTools] = useState(true);
+  const [enabledTools, setEnabledTools] = useState<Record<string, boolean>>({});
   const [streaming, setStreaming] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -93,9 +90,7 @@ export function ChatView({ sessionId, onConversationUpdate }: Props) {
         {
           query,
           session_id: sessionId,
-          need_visualization: needViz,
-          need_dispatch: needDispatch,
-          allow_external_tools: allowExternalTools,
+          enabled_tools: enabledTools,
         },
         (event, data) => {
           setMessages((prev) => {
@@ -185,25 +180,8 @@ export function ChatView({ sessionId, onConversationUpdate }: Props) {
 
       <div className="px-6 pb-6 pt-3 bg-gradient-to-t from-cream-100 via-cream-100 to-transparent">
         <div className="max-w-3xl mx-auto">
-          <div className="flex items-center gap-2 mb-2 text-xs flex-wrap">
-            <Toggle
-              icon={<ImageIcon className="w-3.5 h-3.5" />}
-              label="生成图表"
-              active={needViz}
-              onChange={setNeedViz}
-            />
-            <Toggle
-              icon={<Bell className="w-3.5 h-3.5" />}
-              label="推送企业微信"
-              active={needDispatch}
-              onChange={setNeedDispatch}
-            />
-            <Toggle
-              icon={<Plug className="w-3.5 h-3.5" />}
-              label="允许外部工具"
-              active={allowExternalTools}
-              onChange={setAllowExternalTools}
-            />
+          <div className="mb-2">
+            <ToolSelector enabledTools={enabledTools} onChange={setEnabledTools} />
           </div>
           <div className="card flex items-end gap-2 p-2">
             <textarea
@@ -330,24 +308,34 @@ function ToolInvocationsList({ invocations }: { invocations: ToolInvocation[] })
 }
 
 function ToolInvocationCard({ invocation }: { invocation: ToolInvocation }) {
-  const isError = invocation.status === "error";
+  const status = invocation.status;
   const argsPreview = formatArgsOneLine(invocation.args);
-  const body = isError ? invocation.error ?? "未知错误" : invocation.result ?? "";
+  const body =
+    status === "error" || status === "rejected"
+      ? invocation.error ?? "未知错误"
+      : invocation.result ?? "";
+
+  const statusStyle = (() => {
+    switch (status) {
+      case "error":
+        return { wrap: "border-red-200 bg-red-50/40", icon: <XCircle className="w-4 h-4 text-red-500 shrink-0" /> };
+      case "rejected":
+        return { wrap: "border-amber-200 bg-amber-50/40", icon: <Ban className="w-4 h-4 text-amber-600 shrink-0" /> };
+      case "pending":
+        return { wrap: "border-cream-300 bg-cream-50/60", icon: <Loader2 className="w-4 h-4 text-ink-400 shrink-0 animate-spin" /> };
+      case "success":
+      default:
+        return { wrap: "border-cream-300 bg-cream-50/60", icon: <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> };
+    }
+  })();
+
+  const sectionLabel =
+    status === "rejected" ? "未启用" : status === "error" ? "错误" : "返回摘要";
 
   return (
-    <details
-      className={`group rounded-lg border text-sm ${
-        isError
-          ? "border-red-200 bg-red-50/40"
-          : "border-cream-300 bg-cream-50/60"
-      }`}
-    >
+    <details className={`group rounded-lg border text-sm ${statusStyle.wrap}`}>
       <summary className="cursor-pointer select-none flex items-center gap-2 px-3 py-2">
-        {isError ? (
-          <XCircle className="w-4 h-4 text-red-500 shrink-0" />
-        ) : (
-          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-        )}
+        {statusStyle.icon}
         <code className="font-mono text-[13px] text-ink-700 font-medium">
           {invocation.name}
         </code>
@@ -368,12 +356,14 @@ function ToolInvocationCard({ invocation }: { invocation: ToolInvocation }) {
         )}
         <div>
           <div className="text-[11px] uppercase tracking-wide text-ink-400 mb-1">
-            {isError ? "错误" : "返回摘要"}
+            {sectionLabel}
           </div>
           <pre
             className={`text-xs rounded p-2 overflow-x-auto whitespace-pre-wrap break-all ${
-              isError
+              status === "error"
                 ? "bg-red-50 text-red-700"
+                : status === "rejected"
+                ? "bg-amber-50 text-amber-800"
                 : "bg-cream-100/80 text-ink-600"
             }`}
           >
@@ -428,32 +418,6 @@ function CitationsList({ citations }: { citations: Citation[] }) {
         ))}
       </ol>
     </details>
-  );
-}
-
-function Toggle({
-  icon,
-  label,
-  active,
-  onChange,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  active: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <button
-      onClick={() => onChange(!active)}
-      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border transition ${
-        active
-          ? "bg-terracotta-500/10 text-terracotta-700 border-terracotta-500/30"
-          : "text-ink-400 border-cream-300 hover:border-ink-400/40"
-      }`}
-    >
-      {icon}
-      <span>{label}</span>
-    </button>
   );
 }
 

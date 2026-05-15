@@ -12,10 +12,9 @@ class AgentState(TypedDict, total=False):
         retrieved_docs: RAG 检索到的文档列表。
         citations: 引用来源列表。
         generated_content: LLM 生成的回答内容。
-        tool_results: 工具调用结果字典。
-        need_visualization: 是否需要生成图表。
-        need_dispatch: 是否需要推送消息。
-        mermaid_code: 生成的 Mermaid DSL 代码。
+        tool_invocations: 工具调用记录列表 [{name, args, status, result|error}]。
+        mermaid_code: 工具调用结果中提取的 Mermaid DSL（兼容前端单字段渲染）。
+        enabled_tools: 本次请求启用的工具集合。
         session_id: 当前会话 ID。
     """
 
@@ -24,8 +23,7 @@ class AgentState(TypedDict, total=False):
     retrieved_docs: list[dict[str, Any]]
     citations: list[dict[str, Any]]
     generated_content: str
-    tool_results: dict[str, Any]
-    need_visualization: bool
-    need_dispatch: bool
+    tool_invocations: list[dict[str, Any]]
     mermaid_code: str
+    enabled_tools: dict[str, bool]
     session_id: str
