@@ -16,7 +16,7 @@ from app.graph.builder import app_graph
 from app.graph.nodes import (
     _extract_text,
     _get_llm,
-    _get_mcp_tools,
+    _get_mcp_tools_by_server,
     build_system_prompt,
 )
 from app.graph.titles import schedule_title_generation
@@ -240,8 +240,8 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                 # 这样 LLM 在闲聊场景下也能完整看到工具菜单，正确回答"你有哪些工具"。
                 system_prompt = build_system_prompt(retrieved_docs, request.enabled_tools)
 
-                loaded_tools = await _get_mcp_tools()
-                available = get_available_tools(loaded_tools, request.enabled_tools)
+                loaded_by_server = await _get_mcp_tools_by_server()
+                available = get_available_tools(loaded_by_server, request.enabled_tools)
                 available_by_name = {t.name: t for t in available}
 
                 base_msgs: list[Any] = [

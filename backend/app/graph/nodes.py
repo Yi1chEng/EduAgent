@@ -30,6 +30,7 @@ EXTERNAL_MCP_CONFIG_PATH = "/mcp_servers.json"
 
 _llm: ChatOpenAI | None = None
 _mcp_tools: dict[str, Any] | None = None
+_mcp_tools_by_server: dict[str, dict[str, Any]] | None = None
 
 
 def _get_llm() -> ChatOpenAI:
@@ -119,42 +120,63 @@ def _load_external_mcp_servers() -> dict[str, dict[str, Any]]:
     return result
 
 
+async def _get_mcp_tools_by_server() -> dict[str, dict[str, Any]]:
+    """加载所有 MCP server 的工具，按 server 分组缓存：{server: {tool_name: tool}}。
+
+    每个 server 单独跑一次 MCP client.get_tools()，是为了拿到稳定的"工具属于哪个 server"信息
+    （langchain-mcp-adapters 的扁平 get_tools 不会回填 server 来源）。
+    多 fork 的代价仅在冷启动时一次，且很多 server（如 npx 的 node 进程）本就是独立子进程。
+    """
+    global _mcp_tools_by_server
+    if _mcp_tools_by_server is not None:
+        return _mcp_tools_by_server
+
+    s = get_settings()
+    env = os.environ.copy()
+    env.update({
+        "WECHAT_WEBHOOK_URL": s.WECHAT_WEBHOOK_URL,
+        "LLM_API_KEY": s.LLM_API_KEY,
+        "LLM_BASE_URL": s.LLM_BASE_URL,
+        "LLM_MODEL_NAME": s.LLM_MODEL_NAME,
+    })
+
+    connections: dict[str, dict[str, Any]] = {
+        "eduagent": {
+            "command": s.MCP_SERVER_COMMAND,
+            "args": [s.MCP_SERVER_ARGS],
+            "transport": "stdio",
+            "env": env,
+        }
+    }
+    connections.update(_load_external_mcp_servers())
+
+    by_server: dict[str, dict[str, Any]] = {}
+    for server_name, server_conn in connections.items():
+        try:
+            single_client = MultiServerMCPClient({server_name: server_conn})
+            tools = await single_client.get_tools()
+            by_server[server_name] = {t.name: t for t in tools}
+            logger.info(
+                f"MCP server '{server_name}' 已加载工具: {list(by_server[server_name].keys())}"
+            )
+        except Exception as e:
+            logger.error(f"MCP server '{server_name}' 加载失败: {e}")
+            by_server[server_name] = {}
+
+    _mcp_tools_by_server = by_server
+    return _mcp_tools_by_server
+
+
 async def _get_mcp_tools() -> dict[str, Any]:
-    """加载内置 + 外部 MCP server 的所有工具，缓存为 {name: tool} 字典。"""
+    """扁平视图：{tool_name: tool}。保留作为兼容入口，内部由 _get_mcp_tools_by_server 派生。"""
     global _mcp_tools
     if _mcp_tools is None:
-        s = get_settings()
-        env = os.environ.copy()
-        env.update({
-            "WECHAT_WEBHOOK_URL": s.WECHAT_WEBHOOK_URL,
-            "LLM_API_KEY": s.LLM_API_KEY,
-            "LLM_BASE_URL": s.LLM_BASE_URL,
-            "LLM_MODEL_NAME": s.LLM_MODEL_NAME,
-        })
-
-        connections: dict[str, dict[str, Any]] = {
-            "eduagent": {
-                "command": s.MCP_SERVER_COMMAND,
-                "args": [s.MCP_SERVER_ARGS],
-                "transport": "stdio",
-                "env": env,
-            }
+        by_server = await _get_mcp_tools_by_server()
+        _mcp_tools = {
+            name: tool
+            for server_tools in by_server.values()
+            for name, tool in server_tools.items()
         }
-        connections.update(_load_external_mcp_servers())
-
-        client = MultiServerMCPClient(connections)
-        try:
-            tools = await client.get_tools()
-        except Exception as e:
-            logger.error(f"MCP 工具加载失败: {e}")
-            _mcp_tools = {}
-            return _mcp_tools
-
-        _mcp_tools = {t.name: t for t in tools}
-        logger.info(
-            f"MCP 服务器: {list(connections.keys())}; "
-            f"已加载工具: {list(_mcp_tools.keys())}"
-        )
     return _mcp_tools
 
 
@@ -255,8 +277,8 @@ async def generator_node(state: AgentState) -> dict[str, Any]:
 
     system_prompt = build_system_prompt(retrieved_docs, enabled_tools)
 
-    loaded_tools = await _get_mcp_tools()
-    available = get_available_tools(loaded_tools, enabled_tools)
+    loaded_by_server = await _get_mcp_tools_by_server()
+    available = get_available_tools(loaded_by_server, enabled_tools)
     available_by_name = {t.name: t for t in available}
 
     llm = _get_llm()

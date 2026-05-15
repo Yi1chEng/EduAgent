@@ -88,6 +88,16 @@ TOOLS_REGISTRY: dict[str, ToolMetadata] = {
         risk_level=RiskLevel.HIGH,
         mcp_server="filesystem",
     ),
+    "context7": ToolMetadata(
+        id="context7",
+        display_name="Context7 文档",
+        description="拉取开源库 / 框架的最新官方文档（React、Next.js、FastAPI、LangChain 等）。"
+        "当用户问到具体库的 API、需要参考最新文档、想避开训练数据陈旧问题时调用。"
+        "暴露 resolve-library-id（先把库名解析成 ID）和 query-docs（再拉文档）两步，"
+        "通常需要先调前者再调后者。",
+        risk_level=RiskLevel.MEDIUM,
+        mcp_server="context7",
+    ),
 }
 
 
@@ -97,29 +107,38 @@ def get_default_enabled_map() -> dict[str, bool]:
 
 
 def get_available_tools(
-    loaded_tools: dict[str, Any],
+    loaded_by_server: dict[str, dict[str, Any]],
     enabled_tools: dict[str, bool] | None,
 ) -> list[Any]:
     """根据用户启用集合 + 实际加载到的 MCP 工具，返回最终暴露给 LLM 的工具列表。
 
     入参：
-        loaded_tools: 通过 MCP client 加载到的全部工具对象，键为 tool name。
-        enabled_tools: 用户在本次请求中显式传入的启用集合。
-                       未在该字典中显式置 True 的工具一律视为未启用。
+        loaded_by_server: {server_name: {tool_name: tool_obj}}，由 graph.nodes 装载。
+        enabled_tools: 用户本次请求显式传入的启用集合。未显式置 True 的工具一律未启用。
+
+    匹配规则：
+        - 若 registry id 命中所在 server 的某个 tool name → 仅暴露该单个工具（tool-level）。
+        - 否则 → 把该 server 暴露的**全部**工具一起加入返回列表（group-level / 兜底）。
+          这一兜底覆盖 github、context7 这类"一个 MCP server 暴露多个子工具"的场景，
+          避免每个子动作都要在前端建一个开关。
 
     返回：
-        list[BaseTool]：可直接 bind_tools(tools) 给 LLM 的工具对象列表。
+        list[BaseTool]：可直接 bind_tools(tools) 给 LLM。
     """
     enabled_tools = enabled_tools or {}
     chosen: list[Any] = []
-    for tool_id in TOOLS_REGISTRY:
+    for tool_id, meta in TOOLS_REGISTRY.items():
         if not enabled_tools.get(tool_id, False):
             continue
-        tool = loaded_tools.get(tool_id)
-        if tool is None:
-            # 注册了但 MCP server 没起来（如外部 server 未配置环境变量）→ 静默跳过
+        server_tools = loaded_by_server.get(meta.mcp_server) or {}
+        if not server_tools:
+            # MCP server 没起来（缺环境变量 / 子进程 fork 失败）→ 静默跳过
             continue
-        chosen.append(tool)
+        if tool_id in server_tools:
+            chosen.append(server_tools[tool_id])
+        else:
+            # group fallback：本 server 的全部工具都暴露
+            chosen.extend(server_tools.values())
     return chosen
 
 
