@@ -11,7 +11,7 @@ class ChatRequest(BaseModel):
     """对话请求模型。
 
     enabled_tools 由前端传入，键为工具 id（与 TOOLS_REGISTRY 对齐），值为是否启用。
-    缺失的键回退到该工具在 registry 中的 default_enabled。
+    所有工具默认禁用——只有显式置 True 的工具才会暴露给 LLM。
     """
     query: str = Field(..., description="用户当前问题")
     session_id: str = Field(..., description="会话ID，用于关联上下文")
@@ -78,14 +78,16 @@ class StreamEvent(BaseModel):
 # ========== 工具注册表 ==========
 
 class ToolConfig(BaseModel):
-    """单个工具的配置项，用于 GET /api/tools 响应。"""
+    """单个工具的配置项，用于 GET /api/tools 响应。
+
+    所有工具统一保管（不再区分 internal / external），默认全部禁用，
+    由用户在前端按需勾选启用。
+    """
     id: str = Field(..., description="工具 id（与 LLM tool name 一致）")
     display_name: str = Field(..., description="UI 展示名称")
     description: str = Field(..., description="工具用途说明")
-    category: str = Field(..., description="internal / external")
     risk_level: str = Field(..., description="LOW / MEDIUM / HIGH")
-    default_enabled: bool = Field(..., description="是否默认启用")
-    mcp_server: str = Field(..., description="提供该工具的 MCP server 名称")
+    mcp_server: str = Field(..., description="提供该工具的 MCP server 名称（仅展示用）")
 
 
 class ToolsListResponse(BaseModel):

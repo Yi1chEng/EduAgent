@@ -50,16 +50,14 @@ export interface ToolInvocation {
 }
 
 // 工具注册表项（GET /api/tools 响应）
-export type ToolCategory = "internal" | "external";
+// 所有工具统一保管，默认全部禁用，由用户主动勾选启用。
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH";
 
 export interface ToolConfig {
   id: string;
   display_name: string;
   description: string;
-  category: ToolCategory;
   risk_level: RiskLevel;
-  default_enabled: boolean;
   mcp_server: string;
 }
 

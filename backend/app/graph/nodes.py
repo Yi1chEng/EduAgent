@@ -162,11 +162,14 @@ def build_system_prompt(
     retrieved_docs: list[dict[str, Any]],
     enabled_tools: dict[str, bool] | None,
 ) -> str:
-    """统一系统提示词。本轮启用的工具会以列表形式列入提示，告诉 LLM 何时调用。"""
+    """统一系统提示词。本轮启用的工具会以列表形式列入提示，告诉 LLM 何时调用。
+
+    注意：工具默认全部禁用，只有 enabled_tools 中显式置 True 的工具才会进入提示词与 bind_tools。
+    """
     enabled_tools = enabled_tools or {}
     tool_lines: list[str] = []
     for tool_id, meta in TOOLS_REGISTRY.items():
-        if not enabled_tools.get(tool_id, meta.default_enabled):
+        if not enabled_tools.get(tool_id, False):
             continue
         risk_tag = (
             "高风险（会改写远端/本地状态，仅当用户明确要求时调用）"
