@@ -1,6 +1,10 @@
 {
-  "_comment": "外部 MCP Server 配置（Claude Desktop 兼容格式）。env/args 支持 ${VAR} 占位符，从 backend/.env 读取；占位变量缺失时会跳过该 server。以 '_' 开头的 key 为禁用项。",
+  "_comment": "MCP Server 统一配置（Claude Desktop 兼容格式）。所有 MCP server 统一管理，不区分内置/外部。env/args 支持 ${VAR} 占位符；占位变量缺失时会跳过该 server。以 '_' 开头的 key 为禁用项。",
   "mcpServers": {
+    "eduagent": {
+      "command": "python",
+      "args": ["/mcp_server/server.py"]
+    },
     "github": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],

@@ -25,8 +25,8 @@ from app.tools.registry import TOOLS_REGISTRY, get_available_tools
 
 logger = logging.getLogger(__name__)
 
-# 外部 MCP 配置文件路径（容器内由 volume 挂载）
-EXTERNAL_MCP_CONFIG_PATH = "/mcp_servers.json"
+# MCP 统一配置文件路径（容器内由 volume 挂载，所有 server 统一管理）
+MCP_CONFIG_PATH = "/mcp_servers.json"
 
 _llm: ChatOpenAI | None = None
 _mcp_tools: dict[str, Any] | None = None
@@ -65,19 +65,30 @@ def _expand_env_placeholders(value: str) -> tuple[str, list[str]]:
     return _ENV_PLACEHOLDER_PATTERN.sub(_sub, value), missing
 
 
-def _load_external_mcp_servers() -> dict[str, dict[str, Any]]:
-    """从 mcp_servers.json 读取外部 MCP server 配置。
+def _load_mcp_servers() -> dict[str, dict[str, Any]]:
+    """从 mcp_servers.json 读取所有 MCP server 配置（统一管理，不区分内置/外部）。
 
     跳过以 '_' 开头的禁用项；env/args 中的 ${VAR} 缺失时跳过该 server。
+    所有 server 的子进程环境自动合并 settings 中的关键变量。
     """
-    path = Path(EXTERNAL_MCP_CONFIG_PATH)
+    path = Path(MCP_CONFIG_PATH)
     if not path.exists():
+        logger.warning(f"MCP 配置文件 {path} 不存在，无 MCP server 可用")
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
         logger.warning(f"无法解析 {path}: {e}")
         return {}
+
+    s = get_settings()
+    base_env = {
+        **os.environ,
+        "WECHAT_WEBHOOK_URL": s.WECHAT_WEBHOOK_URL,
+        "LLM_API_KEY": s.LLM_API_KEY,
+        "LLM_BASE_URL": s.LLM_BASE_URL,
+        "LLM_MODEL_NAME": s.LLM_MODEL_NAME,
+    }
 
     servers = data.get("mcpServers", {})
     result: dict[str, dict[str, Any]] = {}
@@ -115,7 +126,7 @@ def _load_external_mcp_servers() -> dict[str, dict[str, Any]]:
             "command": cfg["command"],
             "args": expanded_args,
             "transport": "stdio",
-            "env": {**os.environ, **env_overrides},
+            "env": {**base_env, **env_overrides},
         }
     return result
 
@@ -123,32 +134,13 @@ def _load_external_mcp_servers() -> dict[str, dict[str, Any]]:
 async def _get_mcp_tools_by_server() -> dict[str, dict[str, Any]]:
     """加载所有 MCP server 的工具，按 server 分组缓存：{server: {tool_name: tool}}。
 
-    每个 server 单独跑一次 MCP client.get_tools()，是为了拿到稳定的"工具属于哪个 server"信息
-    （langchain-mcp-adapters 的扁平 get_tools 不会回填 server 来源）。
-    多 fork 的代价仅在冷启动时一次，且很多 server（如 npx 的 node 进程）本就是独立子进程。
+    所有 server 配置均来自 mcp_servers.json，统一管理，不再特殊处理任何单个 server。
     """
     global _mcp_tools_by_server
     if _mcp_tools_by_server is not None:
         return _mcp_tools_by_server
 
-    s = get_settings()
-    env = os.environ.copy()
-    env.update({
-        "WECHAT_WEBHOOK_URL": s.WECHAT_WEBHOOK_URL,
-        "LLM_API_KEY": s.LLM_API_KEY,
-        "LLM_BASE_URL": s.LLM_BASE_URL,
-        "LLM_MODEL_NAME": s.LLM_MODEL_NAME,
-    })
-
-    connections: dict[str, dict[str, Any]] = {
-        "eduagent": {
-            "command": s.MCP_SERVER_COMMAND,
-            "args": [s.MCP_SERVER_ARGS],
-            "transport": "stdio",
-            "env": env,
-        }
-    }
-    connections.update(_load_external_mcp_servers())
+    connections = _load_mcp_servers()
 
     by_server: dict[str, dict[str, Any]] = {}
     for server_name, server_conn in connections.items():
