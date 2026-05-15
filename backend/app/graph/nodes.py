@@ -25,11 +25,12 @@ from app.tools.registry import TOOLS_REGISTRY, get_available_tools
 
 logger = logging.getLogger(__name__)
 
-# 外部 MCP 配置文件路径（容器内由 volume 挂载）
-EXTERNAL_MCP_CONFIG_PATH = "/mcp_servers.json"
+# MCP 统一配置文件路径（容器内由 volume 挂载，所有 server 统一管理）
+MCP_CONFIG_PATH = "/mcp_servers.json"
 
 _llm: ChatOpenAI | None = None
 _mcp_tools: dict[str, Any] | None = None
+_mcp_tools_by_server: dict[str, dict[str, Any]] | None = None
 
 
 def _get_llm() -> ChatOpenAI:
@@ -64,19 +65,30 @@ def _expand_env_placeholders(value: str) -> tuple[str, list[str]]:
     return _ENV_PLACEHOLDER_PATTERN.sub(_sub, value), missing
 
 
-def _load_external_mcp_servers() -> dict[str, dict[str, Any]]:
-    """从 mcp_servers.json 读取外部 MCP server 配置。
+def _load_mcp_servers() -> dict[str, dict[str, Any]]:
+    """从 mcp_servers.json 读取所有 MCP server 配置（统一管理，不区分内置/外部）。
 
     跳过以 '_' 开头的禁用项；env/args 中的 ${VAR} 缺失时跳过该 server。
+    所有 server 的子进程环境自动合并 settings 中的关键变量。
     """
-    path = Path(EXTERNAL_MCP_CONFIG_PATH)
+    path = Path(MCP_CONFIG_PATH)
     if not path.exists():
+        logger.warning(f"MCP 配置文件 {path} 不存在，无 MCP server 可用")
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
         logger.warning(f"无法解析 {path}: {e}")
         return {}
+
+    s = get_settings()
+    base_env = {
+        **os.environ,
+        "WECHAT_WEBHOOK_URL": s.WECHAT_WEBHOOK_URL,
+        "LLM_API_KEY": s.LLM_API_KEY,
+        "LLM_BASE_URL": s.LLM_BASE_URL,
+        "LLM_MODEL_NAME": s.LLM_MODEL_NAME,
+    }
 
     servers = data.get("mcpServers", {})
     result: dict[str, dict[str, Any]] = {}
@@ -114,82 +126,106 @@ def _load_external_mcp_servers() -> dict[str, dict[str, Any]]:
             "command": cfg["command"],
             "args": expanded_args,
             "transport": "stdio",
-            "env": {**os.environ, **env_overrides},
+            "env": {**base_env, **env_overrides},
         }
     return result
 
 
+async def _get_mcp_tools_by_server() -> dict[str, dict[str, Any]]:
+    """加载所有 MCP server 的工具，按 server 分组缓存：{server: {tool_name: tool}}。
+
+    所有 server 配置均来自 mcp_servers.json，统一管理，不再特殊处理任何单个 server。
+    """
+    global _mcp_tools_by_server
+    if _mcp_tools_by_server is not None:
+        return _mcp_tools_by_server
+
+    connections = _load_mcp_servers()
+
+    by_server: dict[str, dict[str, Any]] = {}
+    for server_name, server_conn in connections.items():
+        try:
+            single_client = MultiServerMCPClient({server_name: server_conn})
+            tools = await single_client.get_tools()
+            by_server[server_name] = {t.name: t for t in tools}
+            logger.info(
+                f"MCP server '{server_name}' 已加载工具: {list(by_server[server_name].keys())}"
+            )
+        except Exception as e:
+            logger.error(f"MCP server '{server_name}' 加载失败: {e}")
+            by_server[server_name] = {}
+
+    _mcp_tools_by_server = by_server
+    return _mcp_tools_by_server
+
+
 async def _get_mcp_tools() -> dict[str, Any]:
-    """加载内置 + 外部 MCP server 的所有工具，缓存为 {name: tool} 字典。"""
+    """扁平视图：{tool_name: tool}。保留作为兼容入口，内部由 _get_mcp_tools_by_server 派生。"""
     global _mcp_tools
     if _mcp_tools is None:
-        s = get_settings()
-        env = os.environ.copy()
-        env.update({
-            "WECHAT_WEBHOOK_URL": s.WECHAT_WEBHOOK_URL,
-            "LLM_API_KEY": s.LLM_API_KEY,
-            "LLM_BASE_URL": s.LLM_BASE_URL,
-            "LLM_MODEL_NAME": s.LLM_MODEL_NAME,
-        })
-
-        connections: dict[str, dict[str, Any]] = {
-            "eduagent": {
-                "command": s.MCP_SERVER_COMMAND,
-                "args": [s.MCP_SERVER_ARGS],
-                "transport": "stdio",
-                "env": env,
-            }
+        by_server = await _get_mcp_tools_by_server()
+        _mcp_tools = {
+            name: tool
+            for server_tools in by_server.values()
+            for name, tool in server_tools.items()
         }
-        connections.update(_load_external_mcp_servers())
-
-        client = MultiServerMCPClient(connections)
-        try:
-            tools = await client.get_tools()
-        except Exception as e:
-            logger.error(f"MCP 工具加载失败: {e}")
-            _mcp_tools = {}
-            return _mcp_tools
-
-        _mcp_tools = {t.name: t for t in tools}
-        logger.info(
-            f"MCP 服务器: {list(connections.keys())}; "
-            f"已加载工具: {list(_mcp_tools.keys())}"
-        )
     return _mcp_tools
+
+
+def _format_tool_line(meta: Any) -> str:
+    """把一条 ToolMetadata 渲染成提示词里的列表项。"""
+    risk_tag = (
+        "高风险（会改写远端/本地状态，仅当用户明确要求时调用）"
+        if meta.risk_level.value == "HIGH"
+        else f"风险:{meta.risk_level.value}"
+    )
+    return f"- `{meta.id}`（{meta.display_name}，{risk_tag}）：{meta.description}"
 
 
 def build_system_prompt(
     retrieved_docs: list[dict[str, Any]],
     enabled_tools: dict[str, bool] | None,
 ) -> str:
-    """统一系统提示词。本轮启用的工具会以列表形式列入提示，告诉 LLM 何时调用。"""
+    """统一系统提示词。
+
+    Agent 始终能看到**全量工具菜单**（registry），但只能调用本轮 enabled_tools=True 的工具。
+    被用户禁用的工具会以"未启用"标签列出，LLM 可以**告知用户"如需此功能请在工具开关中启用"**，
+    但绝不主动调用。
+    """
     enabled_tools = enabled_tools or {}
-    tool_lines: list[str] = []
+
+    enabled_lines: list[str] = []
+    disabled_lines: list[str] = []
     for tool_id, meta in TOOLS_REGISTRY.items():
-        if not enabled_tools.get(tool_id, meta.default_enabled):
-            continue
-        risk_tag = (
-            "高风险（会改写远端/本地状态，仅当用户明确要求时调用）"
-            if meta.risk_level.value == "HIGH"
-            else f"风险:{meta.risk_level.value}"
-        )
-        tool_lines.append(
-            f"- `{meta.id}`（{meta.display_name}，{risk_tag}）：{meta.description}"
+        line = _format_tool_line(meta)
+        if enabled_tools.get(tool_id, False):
+            enabled_lines.append(line)
+        else:
+            disabled_lines.append(line)
+
+    sections: list[str] = []
+    if enabled_lines:
+        sections.append("本轮**可直接调用**的工具：\n" + "\n".join(enabled_lines))
+    else:
+        sections.append("本轮没有任何工具被启用（无法调用任何工具）。")
+
+    if disabled_lines:
+        sections.append(
+            "用户**未启用**的工具（菜单里有，但本轮不可调用）：\n"
+            + "\n".join(disabled_lines)
+            + "\n注意：上述工具不在本轮 bind_tools 列表里，**不要尝试调用**；"
+            "当用户需要相关功能时，请告诉他在输入框上方的【工具】面板里勾选对应项后再发送。"
         )
 
-    if tool_lines:
-        tools_section = (
-            "本轮可用的工具：\n"
-            + "\n".join(tool_lines)
-            + "\n\n工具调用原则：\n"
-            "1. 仅当任务确实需要时才调用；闲聊或简单回答时不要强行调用工具。\n"
-            "2. 高风险工具必须有用户的明确意图（如 推送一下、保存到文件），不要主动调用。\n"
-            "3. 工具调用结果会自动展示给用户，正文中不必复述。\n"
-            "4. 如需图表/可视化，调用 generate_mermaid，把【用户问题 + 当前回答全文】"
-            "作为 description 传入；正文专注解释知识，不要嵌入 mermaid 代码块。\n"
-        )
-    else:
-        tools_section = "本轮没有可用的工具，请直接基于参考资料回答。\n"
+    tools_section = "\n\n".join(sections) + (
+        "\n\n工具调用原则：\n"
+        "1. 仅当任务确实需要时才调用；闲聊或简单回答时不要强行调用工具。\n"
+        "2. 高风险工具必须有用户的明确意图（如 推送一下、保存到文件），不要主动调用。\n"
+        "3. 工具调用结果会自动展示给用户，正文中不必复述。\n"
+        "4. 如需图表/可视化，调用 generate_mermaid，把【用户问题 + 当前回答全文】"
+        "作为 description 传入；正文专注解释知识，不要嵌入 mermaid 代码块。\n"
+        "5. 当用户问【你有哪些工具 / 你能做什么】时，把上面【可直接调用】和【未启用】两类完整告诉他。\n"
+    )
 
     return (
         "你是 EduAgent，专业的教育 AI 助手。基于参考资料生成准确、有教育价值的回答。\n\n"
@@ -233,8 +269,8 @@ async def generator_node(state: AgentState) -> dict[str, Any]:
 
     system_prompt = build_system_prompt(retrieved_docs, enabled_tools)
 
-    loaded_tools = await _get_mcp_tools()
-    available = get_available_tools(loaded_tools, enabled_tools)
+    loaded_by_server = await _get_mcp_tools_by_server()
+    available = get_available_tools(loaded_by_server, enabled_tools)
     available_by_name = {t.name: t for t in available}
 
     llm = _get_llm()

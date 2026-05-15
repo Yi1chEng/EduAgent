@@ -1,4 +1,4 @@
-# EduAgent — 教育领域 RAG + MCP 多 Agent 系统
+﻿# EduAgent — 教育领域 RAG + MCP 多 Agent 系统
 
 > 基于 LangGraph 编排 + 混合检索 RAG + MCP 工具生态的教育智能体。
 > 后端 FastAPI(异步 / SSE 流式),向量库 PostgreSQL+pgvector,LLM 默认 ModelScope Qwen3-30B-A3B,Embedding 默认 SiliconFlow bge-m3。
@@ -31,12 +31,11 @@
 - **LangGraph 编排**:`rag_retriever → generator → dispatcher` 三节点,条件边按需路由,统一同步 / 流式两套接口。
 - **真·SSE token 流式**:从 RAG 命中到工具调用,逐事件推送(`citation` / `token` / `mermaid` / `tool_result` / `done` / `error`),首字延迟即 LLM 的 TTFT。
 - **MCP 工具生态**:
-  - 内置 `generate_mermaid`(LLM 生成图表 DSL,带语法兜底自动修复)、`send_wechat`(企业微信 Webhook 推送)。
-  - 外部任意 MCP server 通过 `mcp_servers.json` 一行接入(`@modelcontextprotocol/server-github`、`fetch`、`filesystem` 等)。
+  - 所有 MCP server 通过 `mcp_servers.json` 统一管理（`eduagent` / `github` / `context7` / `fetch` / `filesystem` 等）。
+  - 工具由用户在前端按需启用，LLM `bind_tools` 自主决定调用哪些工具。
   - 配置文件 `env` / `args` 支持 `${VAR}` 占位符,密钥从环境变量解析,**缺失时安全跳过该 server 并告警**。
-  - LLM `bind_tools` 自主决定调用哪些外部工具。
 - **每次工具调用单独 SSE 推送**:前端按 `{name, args, status, result|error}` 渲染折叠卡片,展示调用名、参数、返回摘要。
-- **可视化 / 推送 / 外部工具三个开关**:聊天框上端并排,默认外部工具开启、其他关闭。
+- **统一工具开关**:聊天框上端,所有工具默认禁用,由用户按需勾选启用。
 - **持久化工件**:`mermaid_code` 与 `tool_invocations` 落盘到 `conversations` 表,会话切走再切回仍能完整重放。
 - **会话标题自动生成**:首轮对话完成后 fire-and-forget 调用 LLM,12 字内主题概括。
 - **MCP 工具预热**:lifespan 启动时 fork stdio 子进程并拉取工具列表,首请求省 1-3 秒。
@@ -73,19 +72,14 @@
 └──────────┼─────────────────────────────────┼───────────────────┘
            ▼                                 ▼
    ┌───────────────┐                  ┌─────────────────────┐
-   │ PostgreSQL 16 │                  │ 内置 MCP Server     │
-   │  + pgvector   │                  │ (stdio 子进程)      │
-   │   HNSW 索引   │                  │  - generate_mermaid │
-   │  3 张表       │                  │  - send_wechat      │
-   └───────────────┘                  └─────────────────────┘
-                                                ▲
-                                                │ stdio
-                                      ┌─────────┴─────────────┐
-                                      │ 外部 MCP servers      │
-                                      │  - github             │
-                                      │  - fetch              │
-                                      │  - filesystem ...     │
-                                      └───────────────────────┘
+   │ PostgreSQL 16 │                  │ MCP Server 集群      │
+   │  + pgvector   │                  │ (统一 stdio 子进程)   │
+   │   HNSW 索引   │                  │  - eduagent         │
+   │  3 张表       │                  │  - github           │
+   └───────────────┘                  │  - context7         │
+                                       │  - fetch            │
+                                       │  - filesystem ...   │
+                                       └─────────────────────┘
 ```
 
 请求流向(以 `/api/chat/stream` 为例,**统一工具注册表**架构):
@@ -185,12 +179,12 @@ EduAgent/
 │   │       └── init_db.py      # 启用 pgvector / 创建表 / 幂等 ALTER / 建索引
 │   ├── Dockerfile              # Python 3.11 + Node.js 22 (npx 启动 npm-based MCP)
 │   └── requirements.txt
-├── mcp_server/                 # 内置 MCP server (stdio 子进程)
+├── mcp_server/                 # 内置 MCP server (统一 stdio 子进程)
 │   ├── server.py               # FastMCP 入口
 │   └── tools/
 │       ├── mermaid.py          # generate_mermaid:LLM 生成 DSL + 危险字符自动修复
 │       └── wechat.py           # send_wechat:企业微信 Webhook
-├── mcp_servers.json            # 外部 MCP server 配置 (${VAR} 占位符)
+├── mcp_servers.json            # MCP server 统一配置 (${VAR} 占位符)
 ├── frontend/                   # React SPA
 │   └── src/
 │       ├── App.tsx
@@ -217,7 +211,7 @@ EduAgent/
 
 - `pydantic_settings.BaseSettings` 从 `.env` 加载,`extra="ignore"` 容忍多余键。
 - `@lru_cache` 的 `get_settings()` 让全应用共享一个 `Settings` 实例。
-- 关键字段:`LLM_*` / `EMBEDDING_*` / `RERANKER_*`(可选) / `DATABASE_URL` / `WECHAT_WEBHOOK_URL` / `MCP_SERVER_COMMAND` / `MCP_SERVER_ARGS` / `RAG_OVERFETCH_MULTIPLIER`(默认 4) / `RAG_RRF_K`(默认 60) / `UPLOAD_DIR`。
+- 关键字段:`LLM_*` / `EMBEDDING_*` / `RERANKER_*`(可选) / `DATABASE_URL` / `WECHAT_WEBHOOK_URL` / `RAG_OVERFETCH_MULTIPLIER`(默认 4) / `RAG_RRF_K`(默认 60) / `UPLOAD_DIR`。
 
 ### 5.3 `app/db/database.py`(连接管理)
 
@@ -280,8 +274,8 @@ EduAgent/
   - 状态产出:`generated_content` / `tool_invocations` / `mermaid_code`(若 `generate_mermaid` 命中则单独提取)。
 - 同模块还有:
   - `_get_llm()`:延迟初始化的 `ChatOpenAI` 单例。
-  - `_get_mcp_tools()`:聚合内置 `eduagent` MCP + 外部 MCP 的工具,缓存为 `{name: tool}`。
-  - `_load_external_mcp_servers()`:从 `mcp_servers.json` 读外部 server 配置,过滤 `_` 前缀,**展开 `${VAR}` 占位符**;变量缺失时跳过该 server 并打印警告。
+  - `_get_mcp_tools()`:从 `mcp_servers.json` 统一加载所有 MCP 工具,缓存为 `{name: tool}`。
+  - `_load_mcp_servers()`:从 `mcp_servers.json` 读所有 server 配置,过滤 `_` 前缀,**展开 `${VAR}` 占位符**;变量缺失时跳过该 server 并打印警告。
   - `_extract_text(result)`:把 MCP 返回的 `list[TextContent]` / dict / str 统一拍平为纯字符串。
   - `_content_to_text(content)`:把 LangChain AIMessage `content`(可能是 list[dict])拍平成 str。
 
@@ -644,7 +638,7 @@ SSE `tool_result` 事件 data 载荷(每次工具调用一条):
 
 ## 九、MCP 工具生态
 
-### 9.1 内置工具(`mcp_server/`)
+### 9.1 内置 eduagent MCP 工具
 
 #### `generate_mermaid(description, diagram_type="flowchart")`
 
@@ -656,19 +650,27 @@ SSE `tool_result` 事件 data 载荷(每次工具调用一条):
 
 - 直接 POST 企业微信 webhook,errcode=0 视为成功。
 
-### 9.2 外部 MCP server
+### 9.2 MCP server 统一配置
 
-编辑 `mcp_servers.json`,把 `_disabled_xxx` 改为 `xxx` 即可启用。`env` / `args` 支持 `${VAR}` 占位符,从宿主环境变量解析:
+所有 MCP server 均在 `mcp_servers.json` 中统一管理（包括 eduagent）。`env` / `args` 支持 `${VAR}` 占位符,从宿主环境变量解析:
 
 ```json
 {
   "mcpServers": {
+    "eduagent": {
+      "command": "python",
+      "args": ["/mcp_server/server.py"]
+    },
     "github": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
       }
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
     }
   }
 }
@@ -683,7 +685,7 @@ INFO:app.graph.nodes:MCP 服务器: ['eduagent', 'github']; 已加载工具: ['g
 
 ### 9.3 工具调度策略(统一注册表)
 
-不再区分"内置直通"和"外部自主"两条路径,所有工具由 LLM 看 system prompt 自主决定调用与否:
+所有工具由 LLM 看 system prompt 自主决定调用与否:
 
 | 风险等级 | system prompt 中的描述 | UI 提示 |
 |---|---|---|

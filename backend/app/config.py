@@ -40,10 +40,6 @@ class Settings(BaseSettings):
     # 企业微信 Webhook
     WECHAT_WEBHOOK_URL: str = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
 
-    # 内置 MCP Server 路径（stdio，容器内 /mcp_server 由 volume 挂载）
-    MCP_SERVER_COMMAND: str = "python"
-    MCP_SERVER_ARGS: str = "/mcp_server/server.py"
-
     # 上传文件目录
     UPLOAD_DIR: str = "uploads"
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ChevronDown, Wrench, AlertTriangle, Plug, Cpu } from "lucide-react";
+import { ChevronDown, Wrench, AlertTriangle } from "lucide-react";
 import { getToolsConfig } from "../lib/api";
 import type { RiskLevel, ToolConfig } from "../lib/types";
 
@@ -8,7 +8,7 @@ interface Props {
   onChange: (enabled: Record<string, boolean>) => void;
 }
 
-/** 工具选择器：拉取 /api/tools，按 internal/external 分组渲染开关。 */
+/** 工具选择器：拉取 /api/tools，所有工具平铺渲染，默认全部禁用。 */
 export function ToolSelector({ enabledTools, onChange }: Props) {
   const [tools, setTools] = useState<ToolConfig[] | null>(null);
   const [open, setOpen] = useState(false);
@@ -20,12 +20,6 @@ export function ToolSelector({ enabledTools, onChange }: Props) {
         const list = await getToolsConfig();
         if (cancelled) return;
         setTools(list);
-        // 仅当父组件未提供启用集合时，才用 registry 默认值初始化
-        if (Object.keys(enabledTools).length === 0) {
-          const defaults: Record<string, boolean> = {};
-          for (const t of list) defaults[t.id] = t.default_enabled;
-          onChange(defaults);
-        }
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error("加载工具列表失败:", err);
@@ -34,19 +28,13 @@ export function ToolSelector({ enabledTools, onChange }: Props) {
     return () => {
       cancelled = true;
     };
-    // 仅在挂载时拉取一次
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (!tools) {
-    return (
-      <div className="text-xs text-ink-400 px-2 py-1">加载工具列表…</div>
-    );
+    return <div className="text-xs text-ink-400 px-2 py-1">加载工具列表…</div>;
   }
 
-  const internal = tools.filter((t) => t.category === "internal");
-  const external = tools.filter((t) => t.category === "external");
-  const enabledCount = Object.values(enabledTools).filter(Boolean).length;
+  const enabledCount = tools.filter((t) => enabledTools[t.id]).length;
 
   const toggle = (id: string) => {
     onChange({ ...enabledTools, [id]: !enabledTools[id] });
@@ -68,53 +56,17 @@ export function ToolSelector({ enabledTools, onChange }: Props) {
           className={`w-4 h-4 ml-auto transition-transform ${open ? "rotate-180" : ""}`}
         />
       </summary>
-      <div className="px-3 pb-3 pt-1 space-y-3 border-t border-cream-300/60">
-        <ToolGroup
-          label="内置工具"
-          icon={<Cpu className="w-3.5 h-3.5" />}
-          tools={internal}
-          enabledTools={enabledTools}
-          onToggle={toggle}
-        />
-        <ToolGroup
-          label="外部工具"
-          icon={<Plug className="w-3.5 h-3.5" />}
-          tools={external}
-          enabledTools={enabledTools}
-          onToggle={toggle}
-        />
-      </div>
-    </details>
-  );
-}
-
-interface ToolGroupProps {
-  label: string;
-  icon: React.ReactNode;
-  tools: ToolConfig[];
-  enabledTools: Record<string, boolean>;
-  onToggle: (id: string) => void;
-}
-
-function ToolGroup({ label, icon, tools, enabledTools, onToggle }: ToolGroupProps) {
-  if (tools.length === 0) return null;
-  return (
-    <div>
-      <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-ink-400 mb-1.5">
-        {icon}
-        <span>{label}</span>
-      </div>
-      <div className="space-y-1.5">
+      <div className="px-3 pb-3 pt-1 space-y-1.5 border-t border-cream-300/60">
         {tools.map((t) => (
           <ToolRow
             key={t.id}
             tool={t}
-            enabled={enabledTools[t.id] ?? t.default_enabled}
-            onToggle={() => onToggle(t.id)}
+            enabled={enabledTools[t.id] ?? false}
+            onToggle={() => toggle(t.id)}
           />
         ))}
       </div>
-    </div>
+    </details>
   );
 }
 
@@ -139,6 +91,7 @@ function ToolRow({ tool, enabled, onToggle }: ToolRowProps) {
             {tool.display_name}
           </code>
           <RiskBadge level={tool.risk_level} />
+          <span className="text-[10px] text-ink-400 font-mono">{tool.mcp_server}</span>
         </div>
         <div className="text-xs text-ink-500 mt-0.5 leading-relaxed">
           {tool.description}
