@@ -4,8 +4,8 @@ import logging
 
 from mcp.server.fastmcp import FastMCP
 
-from tools.mermaid import register_mermaid
-from tools.wechat import register_wechat
+from mermaid import register_mermaid
+from wechat import register_wechat
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
