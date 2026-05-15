@@ -158,41 +158,60 @@ async def _get_mcp_tools() -> dict[str, Any]:
     return _mcp_tools
 
 
+def _format_tool_line(meta: Any) -> str:
+    """把一条 ToolMetadata 渲染成提示词里的列表项。"""
+    risk_tag = (
+        "高风险（会改写远端/本地状态，仅当用户明确要求时调用）"
+        if meta.risk_level.value == "HIGH"
+        else f"风险:{meta.risk_level.value}"
+    )
+    return f"- `{meta.id}`（{meta.display_name}，{risk_tag}）：{meta.description}"
+
+
 def build_system_prompt(
     retrieved_docs: list[dict[str, Any]],
     enabled_tools: dict[str, bool] | None,
 ) -> str:
-    """统一系统提示词。本轮启用的工具会以列表形式列入提示，告诉 LLM 何时调用。
+    """统一系统提示词。
 
-    注意：工具默认全部禁用，只有 enabled_tools 中显式置 True 的工具才会进入提示词与 bind_tools。
+    Agent 始终能看到**全量工具菜单**（registry），但只能调用本轮 enabled_tools=True 的工具。
+    被用户禁用的工具会以"未启用"标签列出，LLM 可以**告知用户"如需此功能请在工具开关中启用"**，
+    但绝不主动调用。
     """
     enabled_tools = enabled_tools or {}
-    tool_lines: list[str] = []
+
+    enabled_lines: list[str] = []
+    disabled_lines: list[str] = []
     for tool_id, meta in TOOLS_REGISTRY.items():
-        if not enabled_tools.get(tool_id, False):
-            continue
-        risk_tag = (
-            "高风险（会改写远端/本地状态，仅当用户明确要求时调用）"
-            if meta.risk_level.value == "HIGH"
-            else f"风险:{meta.risk_level.value}"
-        )
-        tool_lines.append(
-            f"- `{meta.id}`（{meta.display_name}，{risk_tag}）：{meta.description}"
+        line = _format_tool_line(meta)
+        if enabled_tools.get(tool_id, False):
+            enabled_lines.append(line)
+        else:
+            disabled_lines.append(line)
+
+    sections: list[str] = []
+    if enabled_lines:
+        sections.append("本轮**可直接调用**的工具：\n" + "\n".join(enabled_lines))
+    else:
+        sections.append("本轮没有任何工具被启用（无法调用任何工具）。")
+
+    if disabled_lines:
+        sections.append(
+            "用户**未启用**的工具（菜单里有，但本轮不可调用）：\n"
+            + "\n".join(disabled_lines)
+            + "\n注意：上述工具不在本轮 bind_tools 列表里，**不要尝试调用**；"
+            "当用户需要相关功能时，请告诉他在输入框上方的【工具】面板里勾选对应项后再发送。"
         )
 
-    if tool_lines:
-        tools_section = (
-            "本轮可用的工具：\n"
-            + "\n".join(tool_lines)
-            + "\n\n工具调用原则：\n"
-            "1. 仅当任务确实需要时才调用；闲聊或简单回答时不要强行调用工具。\n"
-            "2. 高风险工具必须有用户的明确意图（如 推送一下、保存到文件），不要主动调用。\n"
-            "3. 工具调用结果会自动展示给用户，正文中不必复述。\n"
-            "4. 如需图表/可视化，调用 generate_mermaid，把【用户问题 + 当前回答全文】"
-            "作为 description 传入；正文专注解释知识，不要嵌入 mermaid 代码块。\n"
-        )
-    else:
-        tools_section = "本轮没有可用的工具，请直接基于参考资料回答。\n"
+    tools_section = "\n\n".join(sections) + (
+        "\n\n工具调用原则：\n"
+        "1. 仅当任务确实需要时才调用；闲聊或简单回答时不要强行调用工具。\n"
+        "2. 高风险工具必须有用户的明确意图（如 推送一下、保存到文件），不要主动调用。\n"
+        "3. 工具调用结果会自动展示给用户，正文中不必复述。\n"
+        "4. 如需图表/可视化，调用 generate_mermaid，把【用户问题 + 当前回答全文】"
+        "作为 description 传入；正文专注解释知识，不要嵌入 mermaid 代码块。\n"
+        "5. 当用户问【你有哪些工具 / 你能做什么】时，把上面【可直接调用】和【未启用】两类完整告诉他。\n"
+    )
 
     return (
         "你是 EduAgent，专业的教育 AI 助手。基于参考资料生成准确、有教育价值的回答。\n\n"

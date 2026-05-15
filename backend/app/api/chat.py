@@ -236,14 +236,9 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                 }
 
                 # ===== Stage 2: 准备 LLM + 工具 =====
-                if use_rag:
-                    system_prompt = build_system_prompt(retrieved_docs, request.enabled_tools)
-                else:
-                    system_prompt = (
-                        "你是 EduAgent，专业的教育AI助手。直接、自然地回应用户消息。"
-                        "如果用户在打招呼或闲聊，简短热情地回应；如果在问你的功能，"
-                        "说明你能基于上传的教材回答学习问题、生成图表、推送笔记。"
-                    )
+                # 不论是否走 RAG，系统提示都用同一个 build_system_prompt 渲染，
+                # 这样 LLM 在闲聊场景下也能完整看到工具菜单，正确回答"你有哪些工具"。
+                system_prompt = build_system_prompt(retrieved_docs, request.enabled_tools)
 
                 loaded_tools = await _get_mcp_tools()
                 available = get_available_tools(loaded_tools, request.enabled_tools)
