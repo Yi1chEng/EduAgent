@@ -32,7 +32,7 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
-
+      - ./eval:/app/eval
       - ./mcp_servers.json:/mcp_servers.json:ro
       - upload_data:/app/uploads
 

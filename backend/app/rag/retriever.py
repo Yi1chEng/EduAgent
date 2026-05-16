@@ -1,11 +1,11 @@
-"""向量检索 + 关键词召回 + RRF 融合 + 可选 reranker。
+"""关键词优先 + 向量重排 + 可选 reranker。
 
-- 向量层：pgvector cosine 距离，over-fetch top_k * RAG_OVERFETCH_MULTIPLIER
-- 关键词层：在 over-fetched 候选内，用查询中的关键词命中数排序
-- 融合：Reciprocal Rank Fusion（RRF, k=RAG_RRF_K）
-- 可选 reranker：若 RERANKER_API_KEY 已配置，调用 SiliconFlow bge-reranker 二次排序
+- 关键词层：jieba 分词 → SQL ILIKE AND 前置过滤，缩小搜索空间
+- 向量层：在关键词过滤后的候选集内，pgvector cosine 距离排序
+- 可选 reranker：若 RERANKER_API_KEY 已配置，调用交叉 reranker 二次排序
+- 回退：若 N 个关键词 AND 过滤后候选不足，逐级减关键词；最终回退到全量向量搜索
 
-评估接入：retrieve_detailed() 返回各阶段中间结果，配合 RetrievalConfig 可做 ablation 实验。
+评估接入：retrieve_detailed() 返回各阶段中间结果。
 """
 
 import logging
@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
+import jieba
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,17 +22,26 @@ from app.config import get_settings
 from app.db.database import async_session_factory
 from app.rag.embeddings import embed_text
 
+# 领域词汇，防止 jieba 误切
+_DOMAIN_TERMS = [
+    "智能体", "反应式", "规划式", "混合式", "学习型",
+    "上下文工程", "迁移学习", "模型压缩", "强化学习",
+    "卷积神经网络", "循环神经网络", "目标检测", "图像分割",
+    "知识图谱", "向量检索", "混合检索", "大语言模型",
+    "超参数调整", "反向传播", "损失函数", "激活函数",
+    "过拟合", "欠拟合", "正则化", "归一化", "批标准化",
+]
+for _t in _DOMAIN_TERMS:
+    jieba.add_word(_t)
+
 
 @dataclass(frozen=True)
 class RetrievalConfig:
-    """检索 ablation 配置：关闭某层即模拟单一组件的检索质量。"""
+    """检索配置。"""
 
-    use_keyword: bool = True
-    use_rrf: bool = True
+    keyword_filter_count: int = 5
     use_reranker: bool = True
     use_chapter_filter: bool = True
-    overfetch_multiplier: Optional[int] = None  # None 则用 settings.RAG_OVERFETCH_MULTIPLIER
-    rrf_k: Optional[int] = None  # None 则用 settings.RAG_RRF_K
 
 
 DEFAULT_CONFIG = RetrievalConfig()
@@ -41,13 +51,12 @@ logger = logging.getLogger(__name__)
 # 中文章节匹配（第一章/第1章/第十章 等）
 _CHAPTER_PATTERN = re.compile(r"第\s*([一二三四五六七八九十百零\d]+)\s*章")
 
-# 关键词抽取：连续 CJK 字符段（≥2）或 ASCII 单词（≥2）
-_KEYWORD_PATTERN = re.compile(r"[一-鿿]{2,}|[A-Za-z0-9_]{2,}")
-
 # 不参与关键词召回的停用片段
 _KEYWORD_STOPWORDS = frozenset({
     "什么", "怎么", "如何", "为什么", "请", "请问", "你能", "帮我", "告诉", "解释",
     "what", "how", "why", "the", "and", "for", "with", "please", "tell",
+    "可以", "是否", "哪些", "哪个", "这是", "这个", "那个", "一下", "有没有",
+    "两个", "四个", "几个", "不是", "还是", "常用", "方法", "概念",
 })
 
 
@@ -61,59 +70,22 @@ def _detect_chapter_filter(query: str) -> Optional[str]:
 
 
 def _extract_keywords(query: str) -> list[str]:
-    """提取查询中可用于关键词召回的实义词片段。"""
-    tokens = _KEYWORD_PATTERN.findall(query)
+    """用 jieba 分词提取查询中的实义词（过滤停用词和单字）。"""
+    words = jieba.cut(query)
     seen: set[str] = set()
     result: list[str] = []
-    for tok in tokens:
-        low = tok.lower()
+    for w in words:
+        w = w.strip()
+        if len(w) < 2:
+            continue
+        low = w.lower()
         if low in _KEYWORD_STOPWORDS:
             continue
         if low in seen:
             continue
         seen.add(low)
-        result.append(tok)
+        result.append(w)
     return result
-
-
-def _keyword_score(text_body: str, keywords: list[str]) -> int:
-    """文档对查询关键词的命中分（按出现次数累加）。"""
-    if not keywords:
-        return 0
-    lower = text_body.lower()
-    score = 0
-    for kw in keywords:
-        score += lower.count(kw.lower())
-    return score
-
-
-def _rrf_fuse(
-    vector_ranked: list[dict[str, Any]],
-    keyword_ranked: list[dict[str, Any]],
-    k: int,
-) -> list[dict[str, Any]]:
-    """Reciprocal Rank Fusion：score = sum(1 / (k + rank))。
-
-    依靠 id 作为去重键。
-    """
-    scores: dict[Any, float] = {}
-    by_id: dict[Any, dict[str, Any]] = {}
-
-    for rank, doc in enumerate(vector_ranked, start=1):
-        doc_id = doc["id"]
-        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
-        by_id[doc_id] = doc
-
-    for rank, doc in enumerate(keyword_ranked, start=1):
-        doc_id = doc["id"]
-        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
-        by_id.setdefault(doc_id, doc)
-
-    fused = [
-        {**by_id[doc_id], "rrf_score": score}
-        for doc_id, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    ]
-    return fused
 
 
 async def _rerank(query: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -137,7 +109,7 @@ async def _rerank(query: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:
-        logger.warning(f"Reranker 调用失败，回退到 RRF 顺序: {e}")
+        logger.warning(f"Reranker 调用失败，回退: {e}")
         return docs
 
     results = data.get("results") or []
@@ -154,113 +126,121 @@ async def _rerank(query: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]
     return reranked
 
 
+def _build_row(doc: Any) -> dict[str, Any]:
+    return {
+        "id": doc.id,
+        "text": doc.original_text,
+        "source_file": doc.source_file,
+        "heading_path": doc.heading_path,
+        "chunk_index": doc.chunk_index,
+        "score": 1.0 - float(doc.distance),
+    }
+
+
+async def _vector_search(
+    session: AsyncSession,
+    query_embedding: list[float],
+    top_k: int,
+    chapter_filter: str | None = None,
+    keywords: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """向量搜索，可选章节过滤和关键词 OR + 命中数排序。"""
+    embedding_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
+    params: dict[str, Any] = {
+        "query_embedding": embedding_str,
+        "top_k": top_k,
+    }
+
+    clauses: list[str] = []
+    score_parts: list[str] = []
+
+    if chapter_filter:
+        clauses.append("source_file LIKE :chapter_filter")
+        params["chapter_filter"] = chapter_filter
+
+    if keywords:
+        for i, kw in enumerate(keywords):
+            pname = f"kw{i}"
+            params[pname] = f"%{kw}%"
+            clauses.append(f"original_text ILIKE :{pname}")
+            score_parts.append(
+                f"CASE WHEN original_text ILIKE :{pname} THEN 1 ELSE 0 END"
+            )
+
+    if score_parts:
+        kw_score = " + ".join(score_parts)
+        order_by = f"({kw_score}) DESC, embedding <=> :query_embedding"
+    else:
+        order_by = "embedding <=> :query_embedding"
+
+    where = " OR ".join(clauses) if clauses else "TRUE"
+
+    sql = text(f"""
+        SELECT
+            id, source_file, heading_path, chunk_index, original_text,
+            embedding <=> :query_embedding AS distance
+        FROM knowledge_chunks
+        WHERE {where}
+        ORDER BY {order_by}
+        LIMIT :top_k
+    """)
+
+    result = await session.execute(sql, params)
+    return [_build_row(row) for row in result.fetchall()]
+
+
 async def retrieve_detailed(
     query: str,
     top_k: int = 5,
     config: RetrievalConfig = DEFAULT_CONFIG,
     db: AsyncSession | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """与 retrieve() 等价，但返回各阶段中间结果用于评估/调试。
+    """关键词优先 + 向量重排检索。
+
+    流程：jieba 分词 → SQL ILIKE AND 前置过滤 → 向量排序 → 可选 reranker
 
     返回 dict 的 key:
-        vector    : 向量层召回结果（按 cosine 距离升序，等价于"vector-only top-k"）
-        keyword   : 关键词层重排结果（仅在候选集内，0 分文档已过滤）
-        fused     : RRF 融合后的列表
-        reranked  : 交叉 reranker 二次排序后的列表（未启用 reranker 时 == fused）
-        final     : 截断到 top_k 后的最终结果（等价于 retrieve() 的返回）
+        keyword_filtered : 关键词过滤 + 向量排序的结果（主要结果）
+        fallback          : 回退到全量向量搜索的结果（仅当关键词过滤不足时非空）
+        reranked          : reranker 二次排序后
+        final             : 最终 top_k
     """
-    settings = get_settings()
-    multiplier = config.overfetch_multiplier or settings.RAG_OVERFETCH_MULTIPLIER
-    rrf_k = config.rrf_k or settings.RAG_RRF_K
-    overfetch = max(top_k, top_k * multiplier)
-
-    query_embedding = await embed_text(query)
-    embedding_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
-
+    keywords = _extract_keywords(query)[:config.keyword_filter_count]
     chapter_filter = _detect_chapter_filter(query) if config.use_chapter_filter else None
-    if chapter_filter:
-        logger.info(f"检测到章节过滤条件: {chapter_filter}")
-        sql = text("""
-            SELECT
-                id,
-                source_file,
-                heading_path,
-                chunk_index,
-                original_text,
-                embedding <=> :query_embedding AS distance
-            FROM knowledge_chunks
-            WHERE source_file LIKE :chapter_filter
-            ORDER BY embedding <=> :query_embedding
-            LIMIT :overfetch
-        """)
-        params = {
-            "query_embedding": embedding_str,
-            "overfetch": overfetch,
-            "chapter_filter": chapter_filter,
-        }
-    else:
-        sql = text("""
-            SELECT
-                id,
-                source_file,
-                heading_path,
-                chunk_index,
-                original_text,
-                embedding <=> :query_embedding AS distance
-            FROM knowledge_chunks
-            ORDER BY embedding <=> :query_embedding
-            LIMIT :overfetch
-        """)
-        params = {"query_embedding": embedding_str, "overfetch": overfetch}
+    query_embedding = await embed_text(query)
 
-    async def _execute(session: AsyncSession) -> list[dict[str, Any]]:
-        result = await session.execute(sql, params)
-        rows = result.fetchall()
-        return [
-            {
-                "id": row.id,
-                "text": row.original_text,
-                "source_file": row.source_file,
-                "heading_path": row.heading_path,
-                "chunk_index": row.chunk_index,
-                "score": 1.0 - float(row.distance),  # cosine similarity
-            }
-            for row in rows
-        ]
+    async def _search(session: AsyncSession) -> list[dict[str, Any]]:
+        # 逐级尝试：全部关键词 → 减 1 → ... → 1 → 回退全量向量
+        min_results = max(3, top_k // 3)
+        for n in range(len(keywords), 0, -1):
+            subset = keywords[:n]
+            result = await _vector_search(
+                session, query_embedding, top_k, chapter_filter, subset
+            )
+            if len(result) >= min_results:
+                if n < len(keywords):
+                    logger.info(
+                        f"关键词从 {len(keywords)} 降为 {n} 后命中 {len(result)} 条"
+                    )
+                return result
+
+        logger.info(f"关键词过滤候选不足，回退到全量向量搜索")
+        return await _vector_search(
+            session, query_embedding, top_k, chapter_filter, keywords=None
+        )
 
     if db is not None:
-        candidates = await _execute(db)
+        candidates = await _search(db)
     else:
         async with async_session_factory() as session:
-            candidates = await _execute(session)
+            candidates = await _search(session)
 
+    empty: list[dict[str, Any]] = []
     if not candidates:
-        empty: list[dict[str, Any]] = []
-        return {"vector": empty, "keyword": empty, "fused": empty, "reranked": empty, "final": empty}
+        return {"keyword_filtered": empty, "fallback": empty, "reranked": empty, "final": empty}
 
-    # 关键词层
-    if config.use_keyword:
-        keywords = _extract_keywords(query)
-        if keywords:
-            scored = [
-                (_keyword_score(c["text"], keywords), c) for c in candidates
-            ]
-            keyword_ranked = [
-                c for s, c in sorted(scored, key=lambda x: x[0], reverse=True) if s > 0
-            ]
-        else:
-            keyword_ranked = []
-    else:
-        keyword_ranked = []
-
-    # RRF 融合（关闭时直接退化为向量序）
-    if config.use_rrf and keyword_ranked:
-        fused = _rrf_fuse(candidates, keyword_ranked, k=rrf_k)
-    else:
-        fused = list(candidates)
-
-    # Reranker（关闭或未配置时透传 fused）
-    pre_rerank = fused[: max(top_k * 2, top_k)]
+    # Reranker
+    pre_rerank = candidates[: min(len(candidates), top_k * 2)]
     if config.use_reranker:
         reranked = await _rerank(query, pre_rerank)
     else:
@@ -268,12 +248,12 @@ async def retrieve_detailed(
 
     final = reranked[:top_k]
     logger.info(
-        f"混合检索({config}): 候选 {len(candidates)} → 融合 {len(fused)} → 重排 {len(reranked)} → 返回 {len(final)}"
+        f"检索(query={query[:30]}...): keywords={keywords} "
+        f"候选={len(candidates)} → rerank={len(reranked)} → final={len(final)}"
     )
     return {
-        "vector": candidates,
-        "keyword": keyword_ranked,
-        "fused": fused,
+        "keyword_filtered": candidates,
+        "fallback": empty,
         "reranked": reranked,
         "final": final,
     }
@@ -285,13 +265,13 @@ async def retrieve(
     db: AsyncSession | None = None,
     config: RetrievalConfig = DEFAULT_CONFIG,
 ) -> list[dict[str, Any]]:
-    """混合检索：向量召回 + 关键词召回 → RRF 融合 → 可选 reranker。
+    """关键词优先检索。
 
     Args:
         query: 用户查询文本。
         top_k: 最终返回数量。
-        db: 可选的数据库会话；未传入时自动创建。
-        config: 检索 ablation 配置（默认启用所有层）。
+        db: 可选的数据库会话。
+        config: 检索配置。
 
     Returns:
         检索结果列表，每个元素包含 text, source_file, heading_path, chunk_index, score。

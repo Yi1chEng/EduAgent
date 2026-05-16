@@ -109,39 +109,39 @@ client ──POST {query, session_id, enabled_tools}─► /chat/stream
 
 ### 后端
 
-| 类别 | 选型 | 理由 |
-|---|---|---|
-| Web 框架 | **FastAPI 0.115** | 原生 async / 自动 OpenAPI / Pydantic 校验 / 性能优秀 |
-| ASGI 服务器 | Uvicorn 0.30 (`--reload`) | 开发热重载,生产可换 gunicorn+uvicorn worker |
-| 校验/配置 | Pydantic 2.9 + pydantic-settings 2.5 | 类型安全的 schema 和 `.env` 加载 |
-| ORM | SQLAlchemy 2.0 async + asyncpg 0.29 | 现代异步 ORM,与 FastAPI 异步链路一致 |
-| 向量库 | **PostgreSQL 16 + pgvector 0.3.5** | 单库即可,HNSW 索引 O(log N) 检索,运维心智成本低于专用向量库 |
-| LLM 客户端 | langchain-openai 0.2 | 兼容任意 OpenAI 协议端点(ModelScope / SiliconFlow / DeepSeek / OpenAI 原厂) |
-| 编排框架 | **LangGraph 0.2.39** | 显式状态机比隐式 agent 链路可调试,条件边天然支持 RAG 路由 |
-| MCP 客户端 | **langchain-mcp-adapters 0.0.3** | 一行 `MultiServerMCPClient` 接入多 server,与 LangChain Tool 接口打通 |
-| MCP Server | **FastMCP** (`mcp` 官方 SDK) | stdio 传输,Python 进程间隔离,工具热插拔 |
-| SSE | sse-starlette 2.1 | 真·token 流式,自动处理 CRLF / multiline data |
-| HTTP 客户端 | httpx 0.27 | 原生 async,reranker / wechat 推送复用 |
-| 文件上传 | python-multipart 0.0.12 | FastAPI 默认依赖 |
+| 类别         | 选型                                   | 理由                                                                |
+| ---------- | ------------------------------------ | ----------------------------------------------------------------- |
+| Web 框架     | **FastAPI 0.115**                    | 原生 async / 自动 OpenAPI / Pydantic 校验 / 性能优秀                        |
+| ASGI 服务器   | Uvicorn 0.30 (`--reload`)            | 开发热重载,生产可换 gunicorn+uvicorn worker                                |
+| 校验/配置      | Pydantic 2.9 + pydantic-settings 2.5 | 类型安全的 schema 和 `.env` 加载                                          |
+| ORM        | SQLAlchemy 2.0 async + asyncpg 0.29  | 现代异步 ORM,与 FastAPI 异步链路一致                                         |
+| 向量库        | **PostgreSQL 16 + pgvector 0.3.5**   | 单库即可,HNSW 索引 O(log N) 检索,运维心智成本低于专用向量库                            |
+| LLM 客户端    | langchain-openai 0.2                 | 兼容任意 OpenAI 协议端点(ModelScope / SiliconFlow / DeepSeek / OpenAI 原厂) |
+| 编排框架       | **LangGraph 0.2.39**                 | 显式状态机比隐式 agent 链路可调试,条件边天然支持 RAG 路由                               |
+| MCP 客户端    | **langchain-mcp-adapters 0.0.3**     | 一行 `MultiServerMCPClient` 接入多 server,与 LangChain Tool 接口打通        |
+| MCP Server | **FastMCP** (`mcp` 官方 SDK)           | stdio 传输,Python 进程间隔离,工具热插拔                                       |
+| SSE        | sse-starlette 2.1                    | 真·token 流式,自动处理 CRLF / multiline data                             |
+| HTTP 客户端   | httpx 0.27                           | 原生 async,reranker / wechat 推送复用                                   |
+| 文件上传       | python-multipart 0.0.12              | FastAPI 默认依赖                                                      |
 
 ### 前端
 
-| 类别 | 选型 |
-|---|---|
-| UI 框架 | React 18 + TypeScript 5.6 |
-| 构建 | Vite 5.4(开发代理 `/api → :8000`) |
-| 样式 | Tailwind CSS 3.4 + 自定义 cream/terracotta/ink 调色板 |
-| Markdown | react-markdown + remark-gfm |
-| Mermaid 渲染 | mermaid 11.4(SSR 关闭,按需 init) |
-| 图标 | lucide-react |
+| 类别         | 选型                                              |
+| ---------- | ----------------------------------------------- |
+| UI 框架      | React 18 + TypeScript 5.6                       |
+| 构建         | Vite 5.4(开发代理 `/api → :8000`)                   |
+| 样式         | Tailwind CSS 3.4 + 自定义 cream/terracotta/ink 调色板 |
+| Markdown   | react-markdown + remark-gfm                     |
+| Mermaid 渲染 | mermaid 11.4(SSR 关闭,按需 init)                    |
+| 图标         | lucide-react                                    |
 
 ### 模型默认配置
 
-| 角色 | 模型 | 端点 | 选型理由 |
-|---|---|---|---|
-| LLM | Qwen/Qwen3-30B-A3B-Instruct-2507 | ModelScope | 30B MoE,推理快、免费、教学问答稳定 |
-| Embedding | BAAI/bge-m3 (1024 维) | SiliconFlow | 中英文双语 SOTA,与 db_models `Vector(1024)` 强一致 |
-| Reranker(可选) | BAAI/bge-reranker-v2-m3 | SiliconFlow | 候选集二次排序,留空则不启用 |
+| 角色           | 模型                               | 端点          | 选型理由                                      |
+| ------------ | -------------------------------- | ----------- | ----------------------------------------- |
+| LLM          | Qwen/Qwen3-30B-A3B-Instruct-2507 | ModelScope  | 30B MoE,推理快、免费、教学问答稳定                     |
+| Embedding    | BAAI/bge-m3 (1024 维)             | SiliconFlow | 中英文双语 SOTA,与 db_models `Vector(1024)` 强一致 |
+| Reranker(可选) | BAAI/bge-reranker-v2-m3          | SiliconFlow | 候选集二次排序,留空则不启用                            |
 
 ---
 
@@ -222,23 +222,27 @@ EduAgent/
 ### 5.4 `app/db/init_db.py`(启动初始化)
 
 - 启用 pgvector 扩展。
+
 - `Base.metadata.create_all`:只在表不存在时建表。
+
 - 幂等列补齐(本项目未接 Alembic,以 `ADD COLUMN IF NOT EXISTS` 兜底,适合早期单人项目):
+  
   ```sql
   ALTER TABLE conversations
     ADD COLUMN IF NOT EXISTS mermaid_code TEXT,
     ADD COLUMN IF NOT EXISTS tool_invocations_json TEXT;
   ```
+
 - 建 HNSW 向量索引(cosine ops)与 `(session_id, created_at DESC)` 复合索引(覆盖 `_load_history` 与 `list_sessions`)。
 
 ### 5.5 `app/models/db_models.py`(ORM 模型)
 
-| 表 | 主要字段 | 备注 |
-|---|---|---|
-| `knowledge_chunks` | `id` / `source_file` / `heading_path` / `chunk_index` / `original_text` / `embedding Vector(1024)` / `created_at` | HNSW 索引在 `embedding` 上 |
-| `sessions` | `session_id PK` / `title` / `created_at` / `updated_at` | 标题由 `titles.py` 异步写入 |
-| `conversations` | `id` / `session_id` / `role` / `content` / `citations_json` / `mermaid_code` / `tool_invocations_json` / `created_at` | 后两列承载工件持久化 |
-| `feedbacks` | `id` / `conversation_id` / `rating(±1)` / `comment` / `prompt` / `response` / `created_at` | 同时落盘 prompt 与 response 便于微调采样 |
+| 表                  | 主要字段                                                                                                                  | 备注                            |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| `knowledge_chunks` | `id` / `source_file` / `heading_path` / `chunk_index` / `original_text` / `embedding Vector(1024)` / `created_at`     | HNSW 索引在 `embedding` 上        |
+| `sessions`         | `session_id PK` / `title` / `created_at` / `updated_at`                                                               | 标题由 `titles.py` 异步写入          |
+| `conversations`    | `id` / `session_id` / `role` / `content` / `citations_json` / `mermaid_code` / `tool_invocations_json` / `created_at` | 后两列承载工件持久化                    |
+| `feedbacks`        | `id` / `conversation_id` / `rating(±1)` / `comment` / `prompt` / `response` / `created_at`                            | 同时落盘 prompt 与 response 便于微调采样 |
 
 ### 5.6 `app/models/schemas.py`(Pydantic Schema)
 
@@ -561,6 +565,7 @@ created_at
 ```
 
 设计说明:
+
 - **不建外键**:写入路径全在应用层控,降低 DDL 演进负担(早期项目策略,接 Alembic 后再加)。
 - **citations_json / tool_invocations_json 用 TEXT 而非 JSONB**:简化迁移,反正后端解析后扔给 Pydantic 校验,查询不依赖内部字段。
 - **conversations 复合索引** `(session_id, created_at DESC)`:覆盖 `_load_history` 与 `list_sessions`,O(log N) 拉取。
@@ -571,13 +576,14 @@ created_at
 
 ### 对话
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET`  | `/api/tools` | 返回全部工具元数据(id / display_name / description / category / risk_level / default_enabled / mcp_server),供前端渲染开关 |
-| `POST` | `/api/chat` | 同步对话,返回 `conversation_id` 用于反馈 |
-| `POST` | `/api/chat/stream` | SSE 流式,事件:`citation` / `token` / `mermaid` / `tool_result` / `done` / `error` |
+| 方法     | 路径                 | 说明                                                                                                        |
+| ------ | ------------------ | --------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/api/tools`       | 返回全部工具元数据(id / display_name / description / category / risk_level / default_enabled / mcp_server),供前端渲染开关 |
+| `POST` | `/api/chat`        | 同步对话,返回 `conversation_id` 用于反馈                                                                            |
+| `POST` | `/api/chat/stream` | SSE 流式,事件:`citation` / `token` / `mermaid` / `tool_result` / `done` / `error`                             |
 
 请求体:
+
 ```json
 {
   "query": "请总结牛顿第二定律",
@@ -595,6 +601,7 @@ created_at
 `enabled_tools` 中缺失的键回退到 `TOOLS_REGISTRY[id].default_enabled`,所以前端可以只传用户调整过的工具。
 
 SSE `tool_result` 事件 data 载荷(每次工具调用一条):
+
 ```json
 {
   "name": "generate_mermaid",
@@ -608,24 +615,24 @@ SSE `tool_result` 事件 data 载荷(每次工具调用一条):
 
 ### 会话管理
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET` | `/api/sessions` | 所有会话,按 `updated_at` 倒序 |
-| `GET` | `/api/sessions/{id}/messages` | 单会话全部历史(正序),含 mermaid_code / tool_invocations |
-| `DELETE` | `/api/sessions/{id}` | 删会话 + 关联 feedbacks |
+| 方法       | 路径                            | 说明                                            |
+| -------- | ----------------------------- | --------------------------------------------- |
+| `GET`    | `/api/sessions`               | 所有会话,按 `updated_at` 倒序                        |
+| `GET`    | `/api/sessions/{id}/messages` | 单会话全部历史(正序),含 mermaid_code / tool_invocations |
+| `DELETE` | `/api/sessions/{id}`          | 删会话 + 关联 feedbacks                            |
 
 ### 知识库
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/api/knowledge/upload` | multipart,`.md` 文件;同名覆盖 |
-| `GET` | `/api/knowledge/list` | 文档列表 + chunk 数 |
-| `DELETE` | `/api/knowledge/{doc_name}` | 删除指定文档全部 chunk |
+| 方法       | 路径                          | 说明                      |
+| -------- | --------------------------- | ----------------------- |
+| `POST`   | `/api/knowledge/upload`     | multipart,`.md` 文件;同名覆盖 |
+| `GET`    | `/api/knowledge/list`       | 文档列表 + chunk 数          |
+| `DELETE` | `/api/knowledge/{doc_name}` | 删除指定文档全部 chunk          |
 
 ### 反馈
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
+| 方法     | 路径              | 说明                                              |
+| ------ | --------------- | ----------------------------------------------- |
 | `POST` | `/api/feedback` | `conversation_id` + `rating(±1)` + 可选 `comment` |
 
 ### 健康检查
@@ -679,6 +686,7 @@ SSE `tool_result` 事件 data 载荷(每次工具调用一条):
 **变量缺失时该 server 跳过 + 日志告警**,不影响其他工具与正常对话。
 
 启动日志确认接入成功:
+
 ```
 INFO:app.graph.nodes:MCP 服务器: ['eduagent', 'github']; 已加载工具: ['generate_mermaid', 'send_wechat', 'list_issues', 'create_issue', ...]
 ```
@@ -687,13 +695,14 @@ INFO:app.graph.nodes:MCP 服务器: ['eduagent', 'github']; 已加载工具: ['g
 
 所有工具由 LLM 看 system prompt 自主决定调用与否:
 
-| 风险等级 | system prompt 中的描述 | UI 提示 |
-|---|---|---|
-| `LOW`   | "风险:LOW",描述只读 / 无副作用 | 绿色徽标 |
-| `MEDIUM`| "风险:MEDIUM",描述会发外部网络请求但不写状态 | 琥珀徽标 |
-| `HIGH`  | "高风险(会改写远端/本地状态,仅当用户明确要求时调用)" | 红色徽标 + 警告图标 |
+| 风险等级     | system prompt 中的描述            | UI 提示       |
+| -------- | ----------------------------- | ----------- |
+| `LOW`    | "风险:LOW",描述只读 / 无副作用          | 绿色徽标        |
+| `MEDIUM` | "风险:MEDIUM",描述会发外部网络请求但不写状态   | 琥珀徽标        |
+| `HIGH`   | "高风险(会改写远端/本地状态,仅当用户明确要求时调用)" | 红色徽标 + 警告图标 |
 
 工具进入 LLM 决策的条件:
+
 1. 在 `TOOLS_REGISTRY` 中已注册。
 2. `enabled_tools[id]` 为 `True`(或缺失但 `default_enabled=True`)。
 3. 对应的 MCP server 实际启动成功(外部 server 缺失环境变量则跳过)。
@@ -731,6 +740,7 @@ GITHUB_PERSONAL_ACCESS_TOKEN=
 ```
 
 可调参数:
+
 - `RAG_OVERFETCH_MULTIPLIER`(默认 4):向量层 over-fetch 倍数。
 - `RAG_RRF_K`(默认 60):RRF 融合常数,值越大越偏向均匀融合。
 
@@ -749,6 +759,7 @@ docker compose logs -f backend
 ```
 
 启动日志关注:
+
 - `pgvector 扩展已启用` / `数据库表已创建` / `conversations 表列补齐`
 - `MCP 服务器: ['eduagent', ...]; 已加载工具: [...]`
 - `Application startup complete.`
@@ -788,22 +799,24 @@ API 文档:http://localhost:8000/docs
 
 技术栈:**React 18 + Vite 5 + TypeScript 5.6 + Tailwind 3.4 + react-markdown + mermaid 11**。
 
-| 文件 | 职责 |
-|---|---|
-| `src/App.tsx` | 顶层布局,Sidebar + ChatView/KnowledgePanel 切换,生成会话 id |
-| `src/components/ChatView.tsx` | SSE 解析,流式渲染,工具调用卡片,反馈按钮 |
-| `src/components/ToolSelector.tsx` | 拉 `GET /api/tools` 渲染开关,按 internal/external 分组,LOW/MEDIUM/HIGH 风险徽标 |
-| `src/components/Sidebar.tsx` | 会话列表,新建 / 选择 / 删除 |
-| `src/components/MermaidRenderer.tsx` | 按需 init mermaid,渲染 DSL |
-| `src/components/KnowledgePanel.tsx` | 知识库上传 / 列表 / 删除 |
-| `src/lib/api.ts` | REST + 自实现 SSE 解析(`fetch` + `ReadableStream`,POST 走不了原生 EventSource);含 `getToolsConfig()` |
-| `src/lib/types.ts` | Citation / MessageItem / ToolInvocation / UIMessage / ToolConfig / RiskLevel 等共享类型 |
+| 文件                                   | 职责                                                                                        |
+| ------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `src/App.tsx`                        | 顶层布局,Sidebar + ChatView/KnowledgePanel 切换,生成会话 id                                         |
+| `src/components/ChatView.tsx`        | SSE 解析,流式渲染,工具调用卡片,反馈按钮                                                                   |
+| `src/components/ToolSelector.tsx`    | 拉 `GET /api/tools` 渲染开关,按 internal/external 分组,LOW/MEDIUM/HIGH 风险徽标                       |
+| `src/components/Sidebar.tsx`         | 会话列表,新建 / 选择 / 删除                                                                         |
+| `src/components/MermaidRenderer.tsx` | 按需 init mermaid,渲染 DSL                                                                    |
+| `src/components/KnowledgePanel.tsx`  | 知识库上传 / 列表 / 删除                                                                           |
+| `src/lib/api.ts`                     | REST + 自实现 SSE 解析(`fetch` + `ReadableStream`,POST 走不了原生 EventSource);含 `getToolsConfig()` |
+| `src/lib/types.ts`                   | Citation / MessageItem / ToolInvocation / UIMessage / ToolConfig / RiskLevel 等共享类型        |
 
 SSE 解析关键点(`api.ts::streamChat`):
+
 - 用 `fetch` + `ReadableStream` + `TextDecoder` 自实现 SSE,因为浏览器 `EventSource` 不支持 POST。
 - 按 `\r?\n\r?\n` 分 event,`event:` / `data:` 行分别解析,兼容 `sse-starlette` 默认 CRLF。
 
 工具调用卡片(`ChatView::ToolInvocationCard`):
+
 - 折叠 `<details>`,头部展示工具名 + args 单行预览 + 状态图标。
 - 四种状态各自一种样式:`success`(绿勾) / `error`(红 ✗) / `rejected`(琥珀 Ban,工具未启用) / `pending`(灰色旋转)。
 - 展开后两块 `<pre>`:参数完整 JSON、返回摘要 or 错误堆栈。
@@ -812,16 +825,16 @@ SSE 解析关键点(`api.ts::streamChat`):
 
 ## 十三、运维与排障
 
-| 现象 | 排查 |
-|---|---|
-| 启动日志 `跳过 MCP server 'github'：环境变量未设置或为空` | 在 `backend/.env` 加 `GITHUB_PERSONAL_ACCESS_TOKEN=xxx` 后重启,并在前端 `ToolSelector` 中勾上 GitHub 工具 |
-| `MCP 工具预热失败` | Node.js 缺失 / npx 网络不通 / npm 镜像源问题。Dockerfile 默认设了 `npmmirror`,自建镜像后请保留 |
-| `pgvector 扩展已启用` 失败 | 用 `pgvector/pgvector:pg16` 镜像而非纯 Postgres |
-| 流式接口 token 卡顿 | 检查 LLM 端点是否支持 stream;Qwen3 ModelScope 端点已验证支持 |
-| `首请求很慢` | lifespan 预热失败导致冷启动,看启动日志确认 `MCP 工具已预热,共 N 个` |
-| 切回旧会话看不到 mermaid / 工具卡片 | 该会话的消息是新字段加进 DB 之前写的,后续新消息会有 |
-| 同名 `.md` 重传 chunk 翻倍 | 不会;upload 端点会先 DELETE 同名再插入 |
-| 容器内挂载源码却不重载 | uvicorn `--reload` 监听 `/app`,docker-compose 把 `./backend` 挂为 `/app`;Windows 上文件改动可能延迟,WSL2 下正常 |
+| 现象                                       | 排查                                                                                             |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| 启动日志 `跳过 MCP server 'github'：环境变量未设置或为空` | 在 `backend/.env` 加 `GITHUB_PERSONAL_ACCESS_TOKEN=xxx` 后重启,并在前端 `ToolSelector` 中勾上 GitHub 工具    |
+| `MCP 工具预热失败`                             | Node.js 缺失 / npx 网络不通 / npm 镜像源问题。Dockerfile 默认设了 `npmmirror`,自建镜像后请保留                         |
+| `pgvector 扩展已启用` 失败                      | 用 `pgvector/pgvector:pg16` 镜像而非纯 Postgres                                                      |
+| 流式接口 token 卡顿                            | 检查 LLM 端点是否支持 stream;Qwen3 ModelScope 端点已验证支持                                                  |
+| `首请求很慢`                                  | lifespan 预热失败导致冷启动,看启动日志确认 `MCP 工具已预热,共 N 个`                                                   |
+| 切回旧会话看不到 mermaid / 工具卡片                  | 该会话的消息是新字段加进 DB 之前写的,后续新消息会有                                                                   |
+| 同名 `.md` 重传 chunk 翻倍                     | 不会;upload 端点会先 DELETE 同名再插入                                                                    |
+| 容器内挂载源码却不重载                              | uvicorn `--reload` 监听 `/app`,docker-compose 把 `./backend` 挂为 `/app`;Windows 上文件改动可能延迟,WSL2 下正常 |
 
 ---
 

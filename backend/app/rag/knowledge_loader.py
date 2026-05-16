@@ -133,7 +133,7 @@ async def load_file(file_path: str, db: AsyncSession) -> int:
         return 0
 
     # 批量生成 embedding
-    texts = [c["text"] for c in all_chunks]
+    texts = [c["heading_path"] + "\n" + c["text"] for c in all_chunks]
     embeddings = await embed_batch(texts)
 
     # 批量入库

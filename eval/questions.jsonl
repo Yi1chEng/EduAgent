@@ -1,0 +1,20 @@
+{"id": "q01", "query": "智能体的基本定义是什么？", "gold_chunk_ids": [3946, 3947]}
+{"id": "q02", "query": "AlphaGo Zero取得了什么里程碑式的成就？", "gold_chunk_ids": [3953]}
+{"id": "q03", "query": "规划式智能体和反应式智能体有什么区别？", "gold_chunk_ids": [3960, 3961, 3962]}
+{"id": "q04", "query": "什么是混合式智能体？", "gold_chunk_ids": [3962]}
+{"id": "q05", "query": "LLM智能体与传统智能体的核心决策机制有什么区别？", "gold_chunk_ids": [3955, 3956, 3957]}
+{"id": "q06", "query": "卷积神经网络的基本结构是什么？", "gold_chunk_ids": [5361, 5362, 5363]}
+{"id": "q07", "query": "什么是上下文工程？", "gold_chunk_ids": [4556, 4558]}
+{"id": "q08", "query": "迁移学习的基本概念是什么？", "gold_chunk_ids": [6256, 6257, 6259]}
+{"id": "q09", "query": "模型压缩有哪些常用方法？", "gold_chunk_ids": [6380, 6383, 6384]}
+{"id": "q10", "query": "今天北京的天气怎么样？", "gold_chunk_ids": []}
+{"id": "q11", "query": "在GAN中，生成器和判别器各自负责什么？", "gold_chunk_ids": [3888, 3889]}
+{"id": "q12", "query": "PEAS模型如何描述任务环境？", "gold_chunk_ids": [3968]}
+{"id": "q13", "query": "为什么要从零开始构建自己的Agent框架？", "gold_chunk_ids": [4073, 4074]}
+{"id": "q14", "query": "条件生成对抗网络(CGAN)与原始GAN的主要区别是什么？", "gold_chunk_ids": [3915, 3916]}
+{"id": "q15", "query": "智能体应用有哪两种主要的协作模式？", "gold_chunk_ids": [4006]}
+{"id": "q16", "query": "RNN为什么会出现梯度消失现象？", "gold_chunk_ids": [5970]}
+{"id": "q17", "query": "LSTM的三个门分别是什么？", "gold_chunk_ids": [5974]}
+{"id": "q18", "query": "变量与随机变量有什么区别？", "gold_chunk_ids": [4049]}
+{"id": "q19", "query": "Agentic RL的核心思想是什么？", "gold_chunk_ids": [6003]}
+{"id": "q20", "query": "智能体性能评估为什么重要？", "gold_chunk_ids": [6651, 6656]}
