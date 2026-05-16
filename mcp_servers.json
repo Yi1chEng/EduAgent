@@ -3,7 +3,7 @@
   "mcpServers": {
     "eduagent": {
       "command": "python",
-      "args": ["/mcp_server/server.py"]
+      "args": ["/app/app/tools/server.py"]
     },
     "github": {
       "command": "npx",
