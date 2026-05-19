@@ -11,6 +11,7 @@ langchain-core>=0.3.36
 langchain-openai>=0.2.3
 langgraph>=0.2.39
 langchain-mcp-adapters>=0.0.3
+mcp-server-fetch>=2025.4.7
 httpx==0.27.2
 jieba==0.42.1
 sse-starlette==2.1.3

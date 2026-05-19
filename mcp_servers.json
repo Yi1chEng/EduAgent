@@ -14,15 +14,18 @@
     },
     "context7": {
       "command": "npx",
-      "args": ["-y", "@upstash/context7-mcp"]
+      "args": ["-y", "@upstash/context7-mcp"],
+      "env": {
+        "CONTEXT7_API_KEY": "${CONTEXT7_API_KEY}"
+      }
+    },
+    "fetch": {
+      "command": "python",
+      "args": ["-m", "mcp_server_fetch"]
     },
     "_disabled_filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/app/uploads"]
-    },
-    "_disabled_fetch": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-fetch"]
     }
   }
 }
