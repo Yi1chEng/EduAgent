@@ -99,22 +99,22 @@ whether to invoke external tools via LLM function calling.
 The retrieval module implements a **progressive recall** strategy designed for
 Chinese educational corpora:
 
-| Stage | Technique | Purpose |
-|-------|-----------|---------|
-| 1. Keyword Extraction | jieba tokenization + domain dictionary | Extract meaningful terms; filter stopwords |
-| 2. Chapter Filter | Regex `第X章` detection | Pin retrieval to a specific textbook chapter |
-| 3. Keyword Pre-filter | SQL `ILIKE AND` over `knowledge_chunks` | Narrow candidate set before vector scoring |
-| 4. Vector Ranking | pgvector `<=>` cosine distance | Rank candidates by semantic similarity |
-| 5. Fallback | Progressive keyword relaxation → full vector | Gracefully degrade when candidates are sparse |
-| 6. Re-ranking | Qwen3-Reranker-4B (optional, configurable) | Cross-encoder refinement of top candidates |
+| Stage                 | Technique                                    | Purpose                                       |
+| --------------------- | -------------------------------------------- | --------------------------------------------- |
+| 1. Keyword Extraction | jieba tokenization + domain dictionary       | Extract meaningful terms; filter stopwords    |
+| 2. Chapter Filter     | Regex `第X章` detection                        | Pin retrieval to a specific textbook chapter  |
+| 3. Keyword Pre-filter | SQL `ILIKE AND` over `knowledge_chunks`      | Narrow candidate set before vector scoring    |
+| 4. Vector Ranking     | pgvector `<=>` cosine distance               | Rank candidates by semantic similarity        |
+| 5. Fallback           | Progressive keyword relaxation → full vector | Gracefully degrade when candidates are sparse |
+| 6. Re-ranking         | Qwen3-Reranker-4B (optional, configurable)   | Cross-encoder refinement of top candidates    |
 
 **Evaluation results (RQ1, 9 labeled samples on AI textbook corpus):**
 
-| Ablation | Recall@1 | Hit@5 | MRR | nDCG@10 |
-|----------|----------|-------|-----|---------|
-| Vector Only | 0.003 | 0.111 | 0.111 | 0.025 |
-| + Keyword + RRF | **0.017** | **0.222** | **0.222** | **0.053** |
-| + Reranker (full) | 0.017 | 0.222 | 0.222 | 0.053 |
+| Ablation          | Recall@1  | Hit@5     | MRR       | nDCG@10   |
+| ----------------- | --------- | --------- | --------- | --------- |
+| Vector Only       | 0.003     | 0.111     | 0.111     | 0.025     |
+| + Keyword + RRF   | **0.017** | **0.222** | **0.222** | **0.053** |
+| + Reranker (full) | 0.017     | 0.222     | 0.222     | 0.053     |
 
 ---
 
@@ -145,16 +145,17 @@ system prompt.
 All tools are managed via a unified MCP configuration (`mcp_servers.json`) and a
 registry with risk-level metadata:
 
-| Tool | Risk | Provider | Description |
-|------|------|----------|-------------|
-| `generate_mermaid` | LOW | eduagent (Python) | Convert knowledge into Mermaid DSL diagrams |
-| `send_wechat` | HIGH | eduagent (Python) | Push answers to WeChat Work webhook |
-| `github` | MEDIUM | @modelcontextprotocol/server-github (npm) | Search repos, issues, PRs, code. Requires `GITHUB_PERSONAL_ACCESS_TOKEN` |
-| `fetch` | MEDIUM | mcp-server-fetch (PyPI, run via `python -m mcp_server_fetch`) | Fetch web page content from URLs, with optional Markdown conversion |
-| `filesystem` | HIGH | @modelcontextprotocol/server-filesystem (npm) | Read/write files in uploads directory (disabled by default) |
-| `context7` | MEDIUM | @upstash/context7-mcp (npm) | Fetch latest library/framework docs. Requires `CONTEXT7_API_KEY` |
+| Tool               | Risk   | Provider                                                      | Description                                                              |
+| ------------------ | ------ | ------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `generate_mermaid` | LOW    | eduagent (Python)                                             | Convert knowledge into Mermaid DSL diagrams                              |
+| `send_wechat`      | HIGH   | eduagent (Python)                                             | Push answers to WeChat Work webhook                                      |
+| `github`           | MEDIUM | @modelcontextprotocol/server-github (npm)                     | Search repos, issues, PRs, code. Requires `GITHUB_PERSONAL_ACCESS_TOKEN` |
+| `fetch`            | MEDIUM | mcp-server-fetch (PyPI, run via `python -m mcp_server_fetch`) | Fetch web page content from URLs, with optional Markdown conversion      |
+| `filesystem`       | HIGH   | @modelcontextprotocol/server-filesystem (npm)                 | Read/write files in uploads directory (disabled by default)              |
+| `context7`         | MEDIUM | @upstash/context7-mcp (npm)                                   | Fetch latest library/framework docs. Requires `CONTEXT7_API_KEY`         |
 
 **Key design decisions:**
+
 - All tools default to **disabled** — users opt in per request via the frontend
   `ToolSelector`.
 - High-risk tools require explicit user intent in the query.
@@ -181,22 +182,22 @@ vector search.
 Uses DeepSeek as judge to score faithfulness, answer relevance, and context relevance
 across three configurations:
 
-| Configuration | Faithfulness | Answer Relevance |
-|---------------|-------------|-----------------|
-| A0: Plain LLM (no RAG) | 0.100 | 0.990 |
-| A1: RAG Only | 0.365 | 0.690 |
-| A2: EduAgent Full | **0.401** | 0.550 |
+| Configuration          | Faithfulness | Answer Relevance |
+| ---------------------- | ------------ | ---------------- |
+| A0: Plain LLM (no RAG) | 0.100        | 0.990            |
+| A1: RAG Only           | 0.365        | 0.690            |
+| A2: EduAgent Full      | **0.401**    | 0.550            |
 
 **Key insight:** RAG provides a ~4× improvement in faithfulness (0.10 → 0.40),
 confirming its value for educational scenarios where factual accuracy is paramount.
 
 ### RQ4 — Streaming Performance
 
-| Concurrency | TTFT p50 | TTFT p99 | E2E p50 | Success Rate |
-|-------------|----------|----------|---------|-------------|
-| 1 | 594.8 ms | 1602.3 ms | 4289.1 ms | 100% |
-| 3 | 1056.6 ms | 2415.4 ms | 5434.6 ms | 60% |
-| 5 | 1399.1 ms | 2347.0 ms | 6222.0 ms | 60% |
+| Concurrency | TTFT p50  | TTFT p99  | E2E p50   | Success Rate |
+| ----------- | --------- | --------- | --------- | ------------ |
+| 1           | 594.8 ms  | 1602.3 ms | 4289.1 ms | 100%         |
+| 3           | 1056.6 ms | 2415.4 ms | 5434.6 ms | 60%          |
+| 5           | 1399.1 ms | 2347.0 ms | 6222.0 ms | 60%          |
 
 Concurrency failures at >1 are attributed to external LLM endpoint rate-limiting,
 not to the EduAgent orchestration layer.
@@ -229,6 +230,7 @@ docker compose up -d
 ```
 
 This starts:
+
 - **PostgreSQL 16 + pgvector** on port 5432
 - **FastAPI backend** on port 8000
 
@@ -331,28 +333,28 @@ EduAgent/
 
 ## API Reference
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/api/chat` | POST | Synchronous chat (full RAG + tool pipeline) |
-| `/api/chat/stream` | POST | SSE streaming chat with token-by-token output |
-| `/api/tools` | GET | List available tools with risk levels |
-| `/api/sessions` | GET | List all conversation sessions |
-| `/api/sessions/{id}/messages` | GET | Get full history for a session |
-| `/api/sessions/{id}` | DELETE | Delete a session |
-| `/api/knowledge/upload` | POST | Upload and index a Markdown textbook |
-| `/api/feedback` | POST | Submit user feedback (rating + comment) |
+| Endpoint                      | Method | Description                                   |
+| ----------------------------- | ------ | --------------------------------------------- |
+| `/health`                     | GET    | Health check                                  |
+| `/api/chat`                   | POST   | Synchronous chat (full RAG + tool pipeline)   |
+| `/api/chat/stream`            | POST   | SSE streaming chat with token-by-token output |
+| `/api/tools`                  | GET    | List available tools with risk levels         |
+| `/api/sessions`               | GET    | List all conversation sessions                |
+| `/api/sessions/{id}/messages` | GET    | Get full history for a session                |
+| `/api/sessions/{id}`          | DELETE | Delete a session                              |
+| `/api/knowledge/upload`       | POST   | Upload and index a Markdown textbook          |
+| `/api/feedback`               | POST   | Submit user feedback (rating + comment)       |
 
 ### SSE Event Types (from `/api/chat/stream`)
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `citation` | JSON array of `{id, source_file, heading_path}` | Retrieved document metadata |
-| `token` | Plain text | Incremental LLM output token |
-| `tool_result` | JSON `{name, args, status, result?}` | Tool invocation outcome |
-| `mermaid` | Plain text (Mermaid DSL) | Diagram code for frontend rendering |
-| `done` | Conversation ID (int) | Stream completion signal |
-| `error` | Error message (string) | Stream-level error |
+| Event         | Payload                                         | Description                         |
+| ------------- | ----------------------------------------------- | ----------------------------------- |
+| `citation`    | JSON array of `{id, source_file, heading_path}` | Retrieved document metadata         |
+| `token`       | Plain text                                      | Incremental LLM output token        |
+| `tool_result` | JSON `{name, args, status, result?}`            | Tool invocation outcome             |
+| `mermaid`     | Plain text (Mermaid DSL)                        | Diagram code for frontend rendering |
+| `done`        | Conversation ID (int)                           | Stream completion signal            |
+| `error`       | Error message (string)                          | Stream-level error                  |
 
 ---
 
@@ -362,10 +364,10 @@ If you use EduAgent or its components in your research, please cite:
 
 ```bibtex
 @software{eduagent2026,
-  author = {<Authors>},
+  author = {Yi1chEng},
   title = {EduAgent: A Multi-Agent Retrieval-Augmented Generation System for Education},
   year = {2026},
-  url = {https://github.com/<org>/EduAgent}
+  url = {https://github.com/Yi1chEng/EduAgent}
 }
 ```
 
